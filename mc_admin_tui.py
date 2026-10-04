@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -8,6 +9,7 @@ from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
     Footer,
@@ -24,22 +26,86 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 
 from mc_admin_core import (
-    Config,
-    DEFAULT_CONTAINER,
+    DEFAULT_LOCATIONS,
+    DiscoveredServer,
     Location,
     PlayerSnapshot,
+    ServerConfig,
+    available_runtimes,
     container_status,
     find_matches,
     human_name,
     load_items,
+    load_last_server,
     load_locations,
+    load_server_configs,
+    locations_path_for,
+    migrate_legacy_locations,
     parse_players,
     query_player_snapshot,
     rcon,
     restart_container,
     save_locations,
+    scan_servers,
+    server_config_for,
     tail_logs,
+    upsert_server_config,
 )
+
+
+class AddServerScreen(ModalScreen[tuple[str, str] | None]):
+    """Manually register a server that the scan cannot see."""
+
+    CSS = """
+    AddServerScreen {
+        align: center middle;
+    }
+
+    #add-server-body {
+        width: 60;
+        height: auto;
+        padding: 1 2;
+        background: #161b22;
+        border: round #30363d;
+    }
+
+    #add-server-body Input {
+        margin-bottom: 1;
+    }
+    """
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        runtimes = available_runtimes() or ["podman"]
+        with Vertical(id="add-server-body"):
+            yield Label("Register a server", classes="section-title")
+            yield Select(
+                [(runtime, runtime) for runtime in runtimes],
+                value=runtimes[0],
+                allow_blank=False,
+                id="add-runtime",
+            )
+            yield Input(placeholder="Container name", id="add-container")
+            with Horizontal(classes="button-row"):
+                yield Button("Add", id="add-confirm", variant="primary")
+                yield Button("Cancel", id="add-cancel")
+
+    @on(Button.Pressed, "#add-confirm")
+    def confirm(self) -> None:
+        runtime = self.query_one("#add-runtime", Select).value
+        container = self.query_one("#add-container", Input).value.strip()
+        if not isinstance(runtime, str) or not container:
+            self.notify("Runtime and container name required", severity="warning")
+            return
+        self.dismiss((runtime, container))
+
+    @on(Button.Pressed, "#add-cancel")
+    def cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class MinecraftAdminApp(App[None]):
@@ -59,6 +125,32 @@ class MinecraftAdminApp(App[None]):
     #app-body {
         height: 1fr;
         padding: 0 1;
+    }
+
+    #server-bar {
+        height: 4;
+        padding: 0 1;
+        margin-bottom: 1;
+        background: #161b22;
+        border-bottom: solid #30363d;
+        align-vertical: middle;
+    }
+
+    #server-label {
+        width: 16;
+        content-align: left middle;
+        color: #7ee787;
+        text-style: bold;
+    }
+
+    #server-select {
+        width: 1fr;
+        margin-right: 1;
+    }
+
+    #server-scan, #server-add {
+        width: 12;
+        margin-left: 1;
     }
 
     #context-bar {
@@ -211,25 +303,42 @@ class MinecraftAdminApp(App[None]):
 
     BINDINGS = [
         ("ctrl+r", "refresh_players", "Refresh players"),
+        ("ctrl+s", "scan_servers", "Scan servers"),
         ("ctrl+g", "give", "Give"),
         ("ctrl+f", "focus_search", "Search"),
         ("q", "quit", "Quit"),
     ]
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: ServerConfig | None) -> None:
         super().__init__()
         self.config = config
-        self.items, self.catalogue_source = load_items(config.registry)
+        self.discovered: list[DiscoveredServer] = []
+        self.preferred = (
+            config or load_last_server() or (load_server_configs() or [None])[0]
+        )
+        self.items, self.catalogue_source = load_items(
+            self.preferred.registry if self.preferred else None
+        )
         self.matches: list[str] = []
         self.selected_item: str | None = None
         self.selected_player: str | None = None
         self.online_players: list[str] = []
         self.snapshot: PlayerSnapshot | None = None
-        self.locations = load_locations()
+        self.locations: dict[str, Location] = {}
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical(id="app-body"):
+            with Horizontal(id="server-bar"):
+                yield Label("SERVER: none", id="server-label")
+                yield Select(
+                    [],
+                    prompt="No server selected",
+                    allow_blank=True,
+                    id="server-select",
+                )
+                yield Button("Scan", id="server-scan")
+                yield Button("Add", id="server-add")
             with Horizontal(id="context-bar"):
                 yield Label("TARGET: none", id="target-label")
                 yield Select(
@@ -363,7 +472,8 @@ class MinecraftAdminApp(App[None]):
                         yield Button("Send", id="raw-send")
                     yield RichLog(id="server-log", markup=False, wrap=True)
                     yield Label(
-                        "Restart requires typing RESTART. This restarts the Podman container.",
+                        "Restart requires typing RESTART. This restarts the "
+                        "container on its runtime.",
                         id="danger-note",
                     )
                     with Horizontal(id="restart-row"):
@@ -399,11 +509,145 @@ class MinecraftAdminApp(App[None]):
         )
         self._update_matches("")
         self._update_location_options()
+        if self.config is not None:
+            self._activate_server(self.config)
+        self.scan_servers()
+        self.set_interval(5, self.refresh_players)
+        self.set_interval(10, self.refresh_selected_player)
+
+    def _activate_server(self, config: ServerConfig) -> None:
+        self.config = config
+        if config.locations_path:
+            migrate_legacy_locations(config.locations_path)
+            self.locations = load_locations(config.locations_path)
+        else:
+            self.locations = load_locations(DEFAULT_LOCATIONS)
+        self.query_one("#server-label", Label).update(f"SERVER: {config.label}")
+        self._update_location_options()
+        upsert_server_config(config)
         self.refresh_players()
         self.refresh_server_status()
         self.refresh_world_status()
-        self.set_interval(5, self.refresh_players)
-        self.set_interval(10, self.refresh_selected_player)
+
+    @work(thread=True, exclusive=True, group="scan")
+    def scan_servers(self) -> None:
+        try:
+            servers = scan_servers()
+            self.call_from_thread(self._apply_scan, servers, None)
+        except Exception as exc:
+            self.call_from_thread(self._apply_scan, [], str(exc))
+
+    def _apply_scan(self, servers: list[DiscoveredServer], error: str | None) -> None:
+        self.discovered = servers
+        select = self.query_one("#server-select", Select)
+        options = [
+            (
+                f"{server.container}  ({server.runtime}, {server.state or 'unknown'})",
+                f"{server.runtime}:{server.container}",
+            )
+            for server in servers
+        ]
+        select.set_options(options)
+        select.prompt = f"{len(servers)} server(s) found" if servers else "No servers found"
+
+        label = self.query_one("#server-label", Label)
+        if error:
+            label.update("SERVER: scan failed")
+            self._log(f"[red]Server scan failed:[/] {error}")
+            return
+        self._log(
+            f"[dim]Scan:[/] found {len(servers)} Minecraft container(s) "
+            f"across {len(available_runtimes())} runtime(s)"
+        )
+        if servers and self.config is None:
+            first = next(
+                (
+                    s
+                    for s in servers
+                    if self.preferred
+                    and (s.runtime, s.container)
+                    == (self.preferred.runtime, self.preferred.container)
+                ),
+                None,
+            )
+            if first is not None:
+                merged = replace(
+                    server_config_for(first),
+                    registry=self.preferred.registry if self.preferred else None,
+                    locations_path=self.preferred.locations_path
+                    or server_config_for(first).locations_path,
+                )
+                self._activate_server(merged)
+                return
+            first = next(
+                (s for s in servers if s.state == "running" and s.rcon_client),
+                servers[0],
+            )
+            self._activate_server(server_config_for(first))
+        elif self.config is not None:
+            select.value = f"{self.config.runtime}:{self.config.container}"
+
+    @on(Select.Changed, "#server-select")
+    def server_selected(self, event: Select.Changed) -> None:
+        if not isinstance(event.value, str):
+            return
+        runtime, _, container = event.value.partition(":")
+        match = next(
+            (
+                server
+                for server in self.discovered
+                if server.runtime == runtime and server.container == container
+            ),
+            None,
+        )
+        if match is None:
+            return
+        if self.config and (self.config.runtime, self.config.container) == (
+            runtime,
+            container,
+        ):
+            return
+        self._log(f"[bold]Switching to[/] {container} ({runtime})")
+        self._activate_server(server_config_for(match))
+
+    @on(Button.Pressed, "#server-scan")
+    def scan_pressed(self) -> None:
+        self.scan_servers()
+
+    def action_scan_servers(self) -> None:
+        self.scan_servers()
+
+    @on(Button.Pressed, "#server-add")
+    def add_server_pressed(self) -> None:
+        self.push_screen(AddServerScreen(), self._add_manual_server)
+
+    def _add_manual_server(self, selection: tuple[str, str] | None) -> None:
+        if not selection:
+            return
+        runtime, container = selection
+        container = container.strip()
+        if not container:
+            self.notify("Container name required", severity="warning")
+            return
+        server = DiscoveredServer(
+            runtime=runtime, container=container, state="unknown", source="manual"
+        )
+        self.discovered.append(server)
+        config = server_config_for(server)
+        upsert_server_config(config)
+        select = self.query_one("#server-select", Select)
+        select.set_options(
+            [
+                (
+                    f"{item.container}  ({item.runtime}, {item.state or 'unknown'})",
+                    f"{item.runtime}:{item.container}",
+                )
+                for item in self.discovered
+            ]
+        )
+        select.value = f"{runtime}:{container}"
+        self._activate_server(config)
+        self._log(f"[green]✓[/] Added server {container} ({runtime})")
 
     def _log(self, message: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
@@ -435,8 +679,10 @@ class MinecraftAdminApp(App[None]):
 
     @work(thread=True, exclusive=True, group="players")
     def refresh_players(self) -> None:
+        if self.config is None:
+            return
         try:
-            players = parse_players(rcon(self.config.container, "list"))
+            players = parse_players(rcon(self.config, "list"))
             self.call_from_thread(self._apply_players, players, None)
         except Exception as exc:
             self.call_from_thread(self._apply_players, [], str(exc))
@@ -492,10 +738,10 @@ class MinecraftAdminApp(App[None]):
     @work(thread=True, exclusive=True, group="snapshot")
     def refresh_selected_player(self) -> None:
         player = self.selected_player
-        if not player:
+        if not player or self.config is None:
             return
         try:
-            snapshot = query_player_snapshot(self.config.container, player)
+            snapshot = query_player_snapshot(self.config, player)
             self.call_from_thread(self._apply_snapshot, snapshot, None)
         except Exception as exc:
             self.call_from_thread(self._apply_snapshot, None, str(exc))
@@ -539,8 +785,18 @@ class MinecraftAdminApp(App[None]):
 
     @work(thread=True)
     def run_rcon_action(self, label: str, command: str, refresh: bool = False) -> None:
+        if self.config is None:
+            self.call_from_thread(
+                self._rcon_action_finished,
+                label,
+                command,
+                "",
+                "No server selected",
+                False,
+            )
+            return
         try:
-            output = rcon(self.config.container, command)
+            output = rcon(self.config, command)
             self.call_from_thread(
                 self._rcon_action_finished, label, command, output, None, refresh
             )
@@ -799,8 +1055,10 @@ class MinecraftAdminApp(App[None]):
 
     @work(thread=True, exclusive=True, group="world")
     def refresh_world_status(self) -> None:
+        if self.config is None:
+            return
         try:
-            value = rcon(self.config.container, "gamerule keepInventory")
+            value = rcon(self.config, "gamerule keepInventory")
             self.call_from_thread(self._apply_world_status, value, None)
         except Exception as exc:
             self.call_from_thread(self._apply_world_status, "", str(exc))
@@ -878,20 +1136,26 @@ class MinecraftAdminApp(App[None]):
 
     @work(thread=True, exclusive=True, group="server-status")
     def refresh_server_status(self) -> None:
+        if self.config is None:
+            return
         try:
-            value = container_status(self.config.container)
+            value = container_status(self.config)
             self.call_from_thread(self._apply_server_status, value, None)
         except Exception as exc:
             self.call_from_thread(self._apply_server_status, "", str(exc))
 
     def _apply_server_status(self, value: str, error: str | None) -> None:
+        if self.config is None:
+            self.query_one("#server-status", Static).update("No server selected.")
+            return
+        header = f"{self.config.label} ({self.config.runtime})"
         if error:
             self.query_one("#server-status", Static).update(
                 f"Container: {self.config.container}\nStatus unavailable: {error}"
             )
         else:
             self.query_one("#server-status", Static).update(
-                f"[b]{self.config.container}[/b]\n{value}"
+                f"[b]{header}[/b]\n{value}"
             )
 
     @on(Button.Pressed, "#server-refresh")
@@ -908,8 +1172,10 @@ class MinecraftAdminApp(App[None]):
 
     @work(thread=True, exclusive=True, group="server-logs")
     def refresh_server_logs(self) -> None:
+        if self.config is None:
+            return
         try:
-            output = tail_logs(self.config.container, 100)
+            output = tail_logs(self.config, 100)
             self.call_from_thread(self._apply_server_logs, output, None)
         except Exception as exc:
             self.call_from_thread(self._apply_server_logs, "", str(exc))
@@ -950,8 +1216,10 @@ class MinecraftAdminApp(App[None]):
 
     @work(thread=True, exclusive=True, group="restart")
     def restart_server_container(self) -> None:
+        if self.config is None:
+            return
         try:
-            output = restart_container(self.config.container)
+            output = restart_container(self.config)
             self.call_from_thread(self._restart_finished, output, None)
         except Exception as exc:
             self.call_from_thread(self._restart_finished, "", str(exc))
@@ -1017,24 +1285,89 @@ class MinecraftAdminApp(App[None]):
         )
 
 
-def parse_args() -> Config:
-    parser = argparse.ArgumentParser(description="Textual Minecraft server admin TUI")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Textual Minecraft server admin TUI (podman/docker)"
+    )
+    parser.add_argument(
+        "--runtime",
+        choices=["podman", "docker"],
+        help="Container runtime for --container (default: auto-detect).",
+    )
     parser.add_argument(
         "--container",
-        default=DEFAULT_CONTAINER,
-        help=f"Podman container name (default: {DEFAULT_CONTAINER})",
+        help="Container name; skips the startup scan when combined with --runtime."
+    )
+    parser.add_argument(
+        "--rcon-client",
+        default="rcon-cli",
+        help="rcon client binary inside the container (default: rcon-cli).",
+    )
+    parser.add_argument(
+        "--password",
+        help="RCON password (otherwise read from the container config/env).",
     )
     parser.add_argument(
         "--registry",
         type=Path,
         help="Minecraft generated reports/registries.json; imported and cached.",
     )
-    args = parser.parse_args()
-    return Config(container=args.container, registry=args.registry)
+    return parser.parse_args()
+
+
+def config_from_args(args: argparse.Namespace) -> ServerConfig | None:
+    if not args.container:
+        return None
+
+    runtime = args.runtime
+    if runtime is None:
+        available = available_runtimes()
+        runtime = available[0] if available else "podman"
+        if args.container:
+            for candidate in available:
+                if any(
+                    server.container == args.container
+                    for server in scan_servers([candidate])
+                ):
+                    runtime = candidate
+                    break
+
+    container = args.container or ""
+    if args.container and not any(
+        server.container == args.container for server in scan_servers([runtime])
+    ):
+        return ServerConfig(
+            runtime=runtime,
+            container=container,
+            display_name=container,
+            rcon_client=args.rcon_client,
+            rcon_password=args.password,
+            locations_path=locations_path_for(container),
+            registry=args.registry,
+        )
+
+    server = next(
+        (
+            server
+            for server in scan_servers([runtime])
+            if server.container == args.container
+        ),
+        None,
+    )
+    config = server_config_for(
+        server
+        or DiscoveredServer(runtime=runtime, container=container),
+        registry=args.registry,
+    )
+    if args.password:
+        config = replace(config, rcon_password=args.password)
+    if args.rcon_client and args.rcon_client != "rcon-cli":
+        config = replace(config, rcon_client=args.rcon_client)
+    return config
 
 
 def main() -> None:
-    MinecraftAdminApp(parse_args()).run()
+    MinecraftAdminApp(config_from_args(parse_args())).run()
 
 
 if __name__ == "__main__":

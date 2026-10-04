@@ -1,27 +1,55 @@
 # Minecraft Admin TUI
 
-A Textual-based server cockpit for a Podman-hosted Minecraft Java server.
+A Textual-based cockpit for Minecraft Java servers running in **Podman or Docker**
+containers.
 
-The app is designed around a **persistent selected player**: choose a player once in
-the top context bar, then Give, Teleport, Player actions and Fun all operate on that
-same player until you change the target.
+On startup it scans the host, lists every Minecraft container it can find, and lets
+you pick one. The app is designed around a **persistent selected server + selected
+player**: choose a server in the top bar and a player in the context bar, then Give,
+Teleport, Player actions and Fun all operate on those same targets.
 
-Default container:
+![Minecraft Admin TUI — Players tab](docs/demo.png)
 
-```text
-mc_do_not_die
-```
+![Minecraft Admin TUI — Give tab with fuzzy item search](docs/demo-give.png)
+
+## How servers are discovered
+
+1. Every container runtime available on the host is probed (`podman`, then `docker`).
+2. `ps -a` is inspected and containers whose image matches a known Minecraft server
+   image (`itzg/minecraft-server`, `itzg/mc-server`) are kept.
+3. For each match the container is probed for an RCON client (`rcon-cli`, `mcrcon`,
+   `rcon`) and for RCON credentials.
+4. Credentials are auto-detected, in order:
+   - `rcon-cli` config inside the container (`/data/.rcon-cli.yaml`,
+     `/data/.rcon-cli.env`, or `$HOME/.rcon-cli.*`), which is how itzg images
+     provision RCON;
+   - `RCON_PASSWORD` / `RCON_PORT` environment variables on the container.
+
+Nothing is required in advance: for an itzg server with RCON enabled, the app finds
+the container, locates `rcon-cli`, reads `.rcon-cli.yaml` and runs commands without
+you supplying a password.
+
+Containers that do not ship an RCON client are still listed (for status/logs/restart)
+but RCON actions report that no client was found.
 
 ## What is implemented
+
+### Servers
+
+- host scan across Podman and Docker
+- server picker in the top bar (runtime + container + state)
+- manual registration (`Add`) for containers the scan cannot match (non-standard image,
+  remote/rootless runtime, container with an external RCON endpoint)
+- container status (runtime, state, image), Save all, tail logs, raw RCON, restart
+  (requires typing `RESTART`)
+- the last used server is remembered and pre-selected next launch
 
 ### Players
 
 - live active-player picker (`rcon-cli list`)
 - selected-player context persists across tabs
 - player health, food, XP, dimension and coordinates
-- heal
-- feed
-- clear effects
+- heal, feed, clear effects
 - Survival / Creative / Spectator
 - add 10 XP levels
 
@@ -31,7 +59,7 @@ mc_do_not_die
 - aliases such as `fireworks`, `wither skull`, and `deep slate`
 - quantity control
 - exact Minecraft item IDs
-- same generated-registry support as the original prototype
+- optional generated-registry support (see below)
 
 ### Teleport
 
@@ -41,12 +69,6 @@ mc_do_not_die
 - save the selected player's current position as a named location
 - teleport to / delete saved locations
 
-Saved locations live at:
-
-```text
-~/.config/mc-admin-tui/locations.json
-```
-
 ### World
 
 - `keepInventory` on/off and status
@@ -54,26 +76,11 @@ Saved locations live at:
 - weather: clear / rain / thunder
 - difficulty: peaceful / easy / normal / hard
 
-### Server
-
-- Podman container status
-- `save-all`
-- tail the last 100 container log lines
-- raw RCON field
-- restart the Minecraft container (requires typing `RESTART`)
-
-### Activity
+### Activity / Fun
 
 - in-app audit trail for admin actions
-
-### Fun
-
-- totem particles
-- note-block ding
-- glowing effect
-- BONK title
-- summon one chicken
-- lightning strike
+- totem particles, note-block ding, glowing effect, BONK title, summon a chicken,
+  lightning strike
 
 The lightning button is intentionally labelled as dangerous because it can hurt the
 selected player.
@@ -101,12 +108,53 @@ The old entry point is retained too:
 python mc_give_tui.py
 ```
 
+## Usage
+
+Scan-and-pick is the default:
+
+```bash
+mc-admin-tui
+```
+
+Preselect a specific server:
+
+```bash
+mc-admin-tui --runtime podman --container mc_do_not_die
+mc-admin-tui --container oneblock          # runtime auto-detected from the scan
+```
+
+Explicit credentials (only needed when auto-detection cannot find them, e.g. an
+external RCON endpoint):
+
+```bash
+mc-admin-tui --container mc_custom --password hunter2 --rcon-client rcon-cli
+```
+
+Full option list: `mc-admin-tui --help`.
+
 ## Controls
 
+- `Ctrl+S` — rescan the host for servers
 - `Ctrl+R` — refresh online players
 - `Ctrl+F` — focus item search
 - `Ctrl+G` — give selected item
 - `q` — quit when the focused widget isn't consuming the key
+
+## Config and state files
+
+```text
+~/.config/mc-admin-tui/servers.json            known servers + last used
+~/.config/mc-admin-tui/locations/<server>.json saved locations, per server
+~/.cache/mc-admin-tui/items.json               cached item catalogue
+```
+
+Locations are namespaced per container, so `Home` for one server does not collide
+with `Home` for another. A pre-existing shared `locations.json` is imported into the
+first server you open and then renamed to `locations.legacy.json.imported`.
+
+Passwords read from the container are stored in `servers.json` so the app can
+reconnect without re-scanning. That file is written with the same permissions as your
+user config; treat it as sensitive.
 
 ## Full item catalogue
 
@@ -125,24 +173,19 @@ java -DbundlerMainClass=net.minecraft.data.Main \
 Then import it once:
 
 ```bash
-python mc_admin_tui.py --registry generated/reports/registries.json
-```
-
-It caches item IDs at:
-
-```text
-~/.cache/mc-admin-tui/items.json
+mc-admin-tui --registry generated/reports/registries.json
 ```
 
 ## RCON assumptions
 
-The TUI uses the same pattern as the commands you've already been running:
+The TUI runs commands in the same shape as before:
 
 ```text
-podman exec -i mc_do_not_die rcon-cli "<minecraft command>"
+podman exec -w /data -i mc_do_not_die rcon-cli --password <pw> "<minecraft command>"
 ```
 
-The Python process therefore needs permission to invoke Podman on the host.
+The Python process therefore needs permission to invoke Podman/Docker on the host.
+Command shape adapts to the detected client: `mcrcon` uses `-H/-P/-p` flags instead.
 
 ## Notes
 
