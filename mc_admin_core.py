@@ -736,7 +736,13 @@ def items_from_registry(path: Path) -> list[str]:
     return sorted(registry.get("entries", {}).keys())
 
 
+def _bundled_registry() -> Path | None:
+    path = Path(__file__).with_name("registries.json")
+    return path if path.exists() else None
+
+
 def load_items(registry: Path | None) -> tuple[list[str], str]:
+    """Resolve the item catalogue: explicit registry → cache → bundled → fallback."""
     if registry:
         items = items_from_registry(registry)
         DEFAULT_ITEM_CACHE.parent.mkdir(parents=True, exist_ok=True)
@@ -749,7 +755,27 @@ def load_items(registry: Path | None) -> tuple[list[str], str]:
             str(DEFAULT_ITEM_CACHE),
         )
 
+    bundled = _bundled_registry()
+    if bundled:
+        try:
+            return items_from_registry(bundled), f"bundled registry: {bundled.name}"
+        except (ValueError, json.JSONDecodeError):
+            pass
+
     return sorted(FALLBACK_ITEMS), "built-in starter catalogue"
+
+
+def registry_entities(path: Path) -> list[str]:
+    """Entity type ids from a registries.json (for summon/entity pickers)."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    registry = data.get("minecraft:entity_type")
+    if not registry:
+        raise ValueError("No minecraft:entity_type registry found")
+    return sorted(registry.get("entries", {}).keys())
+
+
+def bundled_registry_path() -> Path | None:
+    return _bundled_registry()
 
 
 def parse_players(output: str) -> list[str]:

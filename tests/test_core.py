@@ -28,8 +28,10 @@ from mc_admin_core import (
     human_name,
     human_size,
     is_minecraft_image,
+    items_from_registry,
     list_backups,
     load_custom_kits,
+    load_items,
     load_last_server,
     load_locations,
     load_server_configs,
@@ -613,6 +615,27 @@ class RuleTests(unittest.TestCase):
         self.assertIn("C=mc_test", text)
         self.assertIn("session.lock", text)
         self.assertIn("tar -xzf", text)
+
+
+class RegistryTests(unittest.TestCase):
+    def test_bundled_registry_present(self):
+        from mc_admin_core import bundled_registry_path, registry_entities
+
+        path = bundled_registry_path()
+        self.assertIsNotNone(path, "registries.json should ship with the app")
+        items, source = load_items(None)
+        self.assertGreater(len(items), 100)
+        self.assertIn("minecraft:diamond", items)
+        self.assertIn("registries.json", source)
+        entities = registry_entities(path)
+        self.assertIn("minecraft:creeper", entities)
+
+    def test_items_from_registry_missing_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "r.json"
+            path.write_text('{"minecraft:block": {}}', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                items_from_registry(path)
 
 
 class BindingTests(unittest.TestCase):

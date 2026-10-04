@@ -201,7 +201,8 @@ Full option list: `mc-admin-tui --help`.
 
 - `g` `k` `t` `w` `s` `a` `f` — jump to Give / Kits / Teleport / World / Server /
   Activity / Fun (also `Ctrl+<key>` and `Alt+<key>`; on macOS the Alt form is
-  `Option+<key>`)
+  `Option+<key>`). A jump focuses the tab bar, so one `Tab` then moves into the first
+  field of that tab (e.g. `g`, `Tab` → the item search box)
 - `b` / `Ctrl+B` / `⌥B` — open the Backups modal (`Esc` closes)
 - `Alt+R` — rescan the host for servers
 - `Ctrl+R` — refresh online players
@@ -230,9 +231,17 @@ user config; treat it as sensitive.
 
 ## Full item catalogue
 
-The app ships with a starter catalogue so it works immediately.
+The app ships a bundled `registries.json` baseline (generated from this host's
+server), so autocomplete is exact out of the box — currently **1658 items**.
 
-For exact autocomplete against the Minecraft version you run, generate Mojang's
+Resolution order for the catalogue:
+
+1. `--registry <path>` — import a specific `registries.json` (also caches it, below)
+2. `~/.cache/mc-admin-tui/items.json` — a previously imported/cached catalogue
+3. the bundled `registries.json`
+4. a small built-in starter list (only if none of the above load)
+
+To refresh the baseline against the exact version you run, generate Mojang's
 `registries.json` with the matching server jar:
 
 ```bash
@@ -247,6 +256,9 @@ Then import it once:
 ```bash
 mc-admin-tui --registry generated/reports/registries.json
 ```
+
+The file also carries other registries (`entity_type`, `block`, …); `minecraft:item`
+drives item search and `minecraft:entity_type` is available for entity pickers.
 
 ## RCON assumptions
 

@@ -13,3 +13,7 @@ mc-give-tui = "mc_admin_tui:main"
 
 [tool.setuptools]
 py-modules = ["mc_admin_tui", "mc_admin_core", "mc_give_tui"]
+
+[tool.setuptools.package-data]
+"*" = ["registries.json"]
+

@@ -25,6 +25,7 @@ from textual.widgets import (
     TabPane,
 )
 from textual.widgets.option_list import Option
+from textual.widgets._tabbed_content import ContentTabs
 
 from mc_admin_core import (
     DEFAULT_LOCATIONS,
@@ -864,7 +865,10 @@ class MinecraftAdminApp(App[None]):
         self.call_from_thread(self._apply_server_info, stats, None)
 
     def _apply_server_info(self, stats: dict | None, error: str | None) -> None:
-        widget = self.query_one("#server-info", Static)
+        try:
+            widget = self.query_one("#server-info", Static)
+        except Exception:
+            return  # screen torn down while the worker was running
         if self.config is None:
             widget.update("No server selected.")
             return
@@ -1110,6 +1114,10 @@ class MinecraftAdminApp(App[None]):
         # first so the new pane can take it.
         self.set_focus(None)
         self.query_one(TabbedContent).active = tab_id
+        # Land focus on the tab bar itself, so a single Tab moves into the first
+        # field of the newly shown pane instead of the top context bar.
+        tabs = self.query_one(TabbedContent).get_child_by_type(ContentTabs)
+        tabs.focus()
 
     def action_open_backups(self) -> None:
         if self.config is None:
@@ -1271,14 +1279,7 @@ class MinecraftAdminApp(App[None]):
     def _update_matches(self, query: str) -> None:
         self.matches = find_matches(query, self.items)
         options = [
-            Option(
-                Text.assemble(
-                    (human_name(item_id), "bold"),
-                    ("   ", ""),
-                    (item_id, "dim"),
-                ),
-                id=item_id,
-            )
+            Option(Text(human_name(item_id), style="bold"), id=item_id)
             for item_id in self.matches
         ]
         option_list = self.query_one("#matches", OptionList)
