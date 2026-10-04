@@ -1,0 +1,15 @@
+[project]
+name = "minecraft-admin-tui"
+version = "0.2.0"
+description = "Textual Minecraft Java server admin cockpit over Podman/RCON"
+requires-python = ">=3.10"
+dependencies = [
+    "textual==8.2.8",
+]
+
+[project.scripts]
+mc-admin-tui = "mc_admin_tui:main"
+mc-give-tui = "mc_admin_tui:main"
+
+[tool.setuptools]
+py-modules = ["mc_admin_tui", "mc_admin_core", "mc_give_tui"]
