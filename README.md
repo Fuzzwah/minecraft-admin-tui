@@ -5,10 +5,14 @@ containers.
 
 On startup it scans the host, lists every Minecraft container it can find, and lets
 you pick one. The app is designed around a **persistent selected server + selected
-player**: choose a server in the top bar and a player in the context bar, then Give,
-Teleport, Player actions and Fun all operate on those same targets.
+player**: pick a server and a player, then Give, Teleport, Player actions and Fun all
+operate on those same targets.
 
-![Minecraft Admin TUI — Players tab](docs/demo.png)
+![Minecraft Admin TUI — server info banner, Player tab with inventory](docs/demo.png)
+
+The top section shows, for the selected server: runtime, image, Minecraft version,
+state, uptime, online players and world size — with a **Backups** button that opens the
+world-backup manager as a modal.
 
 ![Minecraft Admin TUI — Give tab with fuzzy item search](docs/demo-give.png)
 
@@ -30,25 +34,35 @@ the container, locates `rcon-cli`, reads `.rcon-cli.yaml` and runs commands with
 you supplying a password.
 
 Containers that do not ship an RCON client are still listed (for status/logs/restart)
-but RCON actions report that no client was found.
+but RCON actions report that no client was found. When the scan finds a single running
+server it is selected automatically (running servers sort first; stopped ones are
+greyed in the list).
 
 ## What is implemented
 
-### Servers
+### Server banner
+
+- **Scan** (left) and **Add** (right) around the server picker
+- collapsible details for the selected server: runtime, image, **Minecraft version**,
+  state, **uptime**, **online players**, **world size**, MOTD
+- version comes from the itzg `VERSION` env (e.g. `26.3`), from a Docker-version
+  server's `mcxbox.properties`, or from the version comment in `server.properties`
+- world size uses `du -sb` when the server is running, else the archive stream
+- **Backups** button (same line) opens the backup manager modal
+
+### Server
 
 - host scan across Podman and Docker
-- server picker in the top bar (runtime + container + state)
-- manual registration (`Add`) for containers the scan cannot match (non-standard image,
-  remote/rootless runtime, container with an external RCON endpoint)
-- container status (runtime, state, image), Save all, tail logs, raw RCON, restart
-  (requires typing `RESTART`)
+- server picker (runtime + container + state), running servers first, stopped greyed
+- manual registration (`Add`) for containers the scan cannot match
+- container status, Save all, tail logs, raw RCON, restart (requires typing `RESTART`)
 - the last used server is remembered and pre-selected next launch
 
-### Players
+### Player
 
-- live active-player picker (`rcon-cli list`)
-- selected-player context persists across tabs
-- player health, food, XP, dimension and coordinates
+- live active-player picker (`rcon-cli list`); the selected player persists across tabs
+- health, food, XP, dimension and coordinates
+- **inventory** (item, quantity and slot per entry)
 - heal, feed, clear effects
 - Survival / Creative / Spectator
 - add 10 XP levels
@@ -71,10 +85,61 @@ but RCON actions report that no client was found.
 
 ### World
 
-- `keepInventory` on/off and status
+- `keepInventory` on/off and status. The correct spelling is resolved against the
+  server at runtime (`keepInventory` vs `keep_inventory`) — newer servers reject the
+  camelCase form, which the app probes for automatically
 - time: day / noon / night / midnight
 - weather: clear / rain / thunder
 - difficulty: peaceful / easy / normal / hard
+
+### Kits
+
+- give a whole bundle of items in one action (one `give` per item, sent in order)
+- built-in kits: `starter`, `tools`, `nether`, `pvp`, `food`, `swimming`
+- `swimming` is a full enchanted diving loadout (respiration turtle helmet, depth
+  strider boots, riptide + loyalty tridents, water-breathing / night-vision potions,
+  golden carrots) — entries use item components, e.g.
+  `minecraft:trident[enchantments={"minecraft:riptide":3,…}]` and
+  `minecraft:potion[minecraft:potion_contents={potion:"minecraft:long_water_breathing"}]`
+- an entry containing a space is sent as a bare command instead of a `give`, so kits
+  can also hold gamerule/`save-all` style commands
+- define custom kits inline: name + comma-separated `item [qty]` list
+  (`diamond_pickaxe, torch 64, cobblestone 64`); namespaces default to
+  `minecraft:` and quantities are clamped to 1–6400
+- custom kits persist to `~/.config/mc-admin-tui/kits.json` and override built-ins of
+  the same name; built-ins are read-only (Delete refuses them)
+
+![Minecraft Admin TUI — Kits tab](docs/demo-kits.png)
+
+### Backups
+
+- one-click world backup, streamed live out of the container (no downtime)
+- `save-all` runs first, so the archive is a clean, flushed copy
+- each world is a single archive containing every dimension (`world/`, `world/DIM-1/`,
+  `world/DIM1/`, `world/data/`, `world/level.dat`, …)
+- works for **running and stopped** containers alike (uses `podman|docker cp` streaming,
+  not `exec`)
+- per-server destination `~/minecraft-backups/<container>/`, gzipped, timestamped, with
+  optional label
+- retention control: keep 5 / 10 / all, plus a manual **Prune now**
+- opened as a modal from the **Backups** button (or `B` / `Ctrl+B` / `⌥B`); `Esc`
+  closes it, so it is not part of the tab rotation
+- **Restore how-to** button in the modal prints the full manual restore steps
+  (`<runtime> stop`, find the `/data` volume, `mv` the old world aside,
+  `tar -xzf … -C $VOL`, `rm -f $VOL/<world>/session.lock`, start) — key points:
+  extract at the **parent** of the world dir, keep the top-level dir name matching
+  `level-name`, and delete the stale `session.lock` a live snapshot may contain
+- restore is intentionally out of scope — archives are plain `tar.gz` you can extract
+  yourself:
+
+  ```bash
+  tar -xzf ~/minecraft-backups/<container>/world-<stamp>.tar.gz -C /path/to/server-data
+  ```
+
+  Restore target is the server's world directory, e.g. `/data/world` inside the
+  container or its backing volume; stop the container first.
+
+![Minecraft Admin TUI — Backups modal](docs/demo-backups.png)
 
 ### Activity / Fun
 
@@ -134,18 +199,25 @@ Full option list: `mc-admin-tui --help`.
 
 ## Controls
 
-- `Ctrl+S` — rescan the host for servers
+- `g` `k` `t` `w` `s` `a` `f` — jump to Give / Kits / Teleport / World / Server /
+  Activity / Fun (also `Ctrl+<key>` and `Alt+<key>`; on macOS the Alt form is
+  `Option+<key>`)
+- `b` / `Ctrl+B` / `⌥B` — open the Backups modal (`Esc` closes)
+- `Alt+R` — rescan the host for servers
 - `Ctrl+R` — refresh online players
-- `Ctrl+F` — focus item search
-- `Ctrl+G` — give selected item
 - `q` — quit when the focused widget isn't consuming the key
+
+While a text field has focus its letters go to the field; use the `Alt`/`Option`
+(and `Ctrl`) variants to switch tabs from there.
 
 ## Config and state files
 
 ```text
 ~/.config/mc-admin-tui/servers.json            known servers + last used
 ~/.config/mc-admin-tui/locations/<server>.json saved locations, per server
+~/.config/mc-admin-tui/kits.json               custom kits
 ~/.cache/mc-admin-tui/items.json               cached item catalogue
+~/minecraft-backups/<container>/               world backups (tar.gz)
 ```
 
 Locations are namespaced per container, so `Home` for one server does not collide
@@ -192,6 +264,5 @@ Command shape adapts to the detected client: `mcrcon` uses `-H/-P/-p` flags inst
 Player status is collected with vanilla `data get entity` commands. The TUI refreshes
 the online-player list every 5 seconds and selected-player status every 10 seconds.
 
-Backups are deliberately not included yet: a safe backup/restore UI should know the
-actual world/volume paths and stop/save the server correctly before destructive
-restore operations.
+Backups contain no restore UI by design; see the Backups section for a manual extract
+one-liner.

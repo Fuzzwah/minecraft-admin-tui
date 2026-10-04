@@ -8,6 +8,7 @@ from pathlib import Path
 from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import (
@@ -28,26 +29,42 @@ from textual.widgets.option_list import Option
 from mc_admin_core import (
     DEFAULT_LOCATIONS,
     DiscoveredServer,
+    Kit,
     Location,
     PlayerSnapshot,
     ServerConfig,
+    all_kits,
     available_runtimes,
+    backup_world,
+    container_level_name,
     container_status,
+    default_backup_dir,
+    discover_worlds,
     find_matches,
     human_name,
+    human_size,
+    list_backups,
+    load_custom_kits,
     load_items,
     load_last_server,
     load_locations,
     load_server_configs,
     locations_path_for,
     migrate_legacy_locations,
+    parse_kit_items,
     parse_players,
+    prune_backups,
+    query_player_inventory,
     query_player_snapshot,
     rcon,
     restart_container,
+    restore_procedure,
+    rule_name,
+    save_custom_kits,
     save_locations,
     scan_servers,
     server_config_for,
+    server_stats,
     tail_logs,
     upsert_server_config,
 )
@@ -108,6 +125,182 @@ class AddServerScreen(ModalScreen[tuple[str, str] | None]):
         self.dismiss(None)
 
 
+class BackupScreen(ModalScreen[None]):
+    """World backup manager, opened as a modal from the server info bar."""
+
+    CSS = """
+    BackupScreen {
+        align: center middle;
+    }
+    """
+
+    BINDINGS = [("escape", "close", "Close")]
+
+    def __init__(self, server: ServerConfig) -> None:
+        super().__init__()
+        self.server = server
+        self.worlds: list[str] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="backup-body"):
+            yield Label("BACKUPS", classes="section-title")
+            yield Static("Scanning…", id="backup-status")
+            yield Label(
+                "Each world (with all its dimensions) is streamed out of the "
+                "container into ~/minecraft-backups/<server>/ and gzipped. Works "
+                "while the server runs; RCON saves first for a clean copy.",
+                classes="help",
+            )
+            with Horizontal(id="backup-row"):
+                yield Select(
+                    [], prompt="No worlds found", allow_blank=True, id="backup-world"
+                )
+                yield Input(placeholder="label (optional)", id="backup-label")
+                yield Select(
+                    [("Keep 5", "5"), ("Keep 10", "10"), ("Keep all", "0")],
+                    value="5",
+                    allow_blank=False,
+                    id="backup-keep",
+                )
+                yield Button("Back up world", id="backup-run", variant="primary")
+            with Horizontal(id="backup-list-row"):
+                yield Select(
+                    [], prompt="No backups yet", allow_blank=True, id="backup-existing"
+                )
+                yield Button("Prune now", id="backup-prune")
+            yield RichLog(id="backup-log", markup=True, wrap=True)
+            with Horizontal(classes="button-row"):
+                yield Button("Restore how-to", id="backup-restore")
+                yield Button("Close", id="backup-close")
+
+    def on_mount(self) -> None:
+        self._refresh_backup_list()
+        self.refresh_worlds()
+
+    def _refresh_backup_list(self) -> None:
+        backups = list_backups(self.server.container)
+        select = self.query_one("#backup-existing", Select)
+        select.set_options(
+            [
+                (f"{path.name}  ({path.stat().st_size / 1e6:.1f} MB)", path.name)
+                for path in backups
+            ]
+        )
+        select.prompt = f"{len(backups)} backup(s)" if backups else "No backups yet"
+
+        directory = default_backup_dir(self.server.container)
+        status = self.query_one("#backup-status", Static)
+        if not backups:
+            status.update(f"No backups yet.\nDestination: {directory}")
+            return
+        newest = backups[0]
+        total = sum(path.stat().st_size for path in backups) / 1e6
+        stamp = datetime.fromtimestamp(newest.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        status.update(
+            f"[b]{len(backups)} backup(s)[/b]  ({total:.0f} MB total)\n"
+            f"Newest: {newest.name}  ({stamp})\n"
+            f"Destination: {directory}"
+        )
+
+    def _log(self, message: str) -> None:
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.query_one("#backup-log", RichLog).write(f"[dim]{stamp}[/]  {message}")
+
+    @work(thread=True, exclusive=True, group="worlds")
+    def refresh_worlds(self) -> None:
+        try:
+            worlds = discover_worlds(self.server)
+            self.app.call_from_thread(self._apply_worlds, worlds, None)
+        except Exception as exc:
+            self.app.call_from_thread(self._apply_worlds, [], str(exc))
+
+    def _apply_worlds(self, worlds: list[str], error: str | None) -> None:
+        select = self.query_one("#backup-world", Select)
+        if error:
+            select.prompt = "World scan failed"
+            self._log(f"[red]World scan failed:[/] {error}")
+            return
+        self.worlds = worlds
+        select.set_options((name, name) for name in worlds)
+        select.prompt = "Choose a world" if worlds else "No worlds found"
+        if worlds:
+            select.value = worlds[0]
+        level = container_level_name(self.server)
+        self._log(
+            f"Detected level-name [b]{level}[/b]; "
+            f"{len(worlds)} world folder(s) in the container."
+        )
+
+    @on(Button.Pressed, "#backup-run")
+    def run_backup(self) -> None:
+        world = self.query_one("#backup-world", Select).value
+        if not isinstance(world, str) or not world:
+            self.notify("Choose a world to back up", severity="warning")
+            return
+        label = self.query_one("#backup-label", Input).value.strip()
+        keep = int(str(self.query_one("#backup-keep", Select).value))
+        self.backup_worker(world, label, keep)
+
+    @work(thread=True, exclusive=True, group="backup")
+    def backup_worker(self, world: str, label: str, keep: int) -> None:
+        self.app.call_from_thread(self._log, f"[b]Backup started[/b] ({world})")
+        try:
+            rcon(self.server, "save-all")
+        except Exception as exc:
+            self.app.call_from_thread(self._log, f"[yellow]save-all skipped:[/] {exc}")
+        try:
+            path = backup_world(
+                self.server,
+                level_name=world,
+                label=label,
+                on_progress=lambda message: self.app.call_from_thread(self._log, message),
+            )
+            removed = prune_backups(path.parent, keep) if keep else []
+            self.app.call_from_thread(self._backup_finished, path, removed, None)
+        except Exception as exc:
+            self.app.call_from_thread(self._backup_finished, None, [], str(exc))
+
+    def _backup_finished(
+        self, path: Path | None, removed: list[Path], error: str | None
+    ) -> None:
+        if error:
+            self._log(f"[red]Backup failed:[/] {error}")
+            self.notify("Backup failed", severity="error")
+            return
+        assert path is not None
+        self._log(f"[green]✓[/] Saved [b]{path}[/b]")
+        for old in removed:
+            self._log(f"[dim]Pruned {old.name}[/]")
+        self.notify(f"Backed up {path.name}")
+        self._refresh_backup_list()
+
+    @on(Button.Pressed, "#backup-prune")
+    def prune_now(self) -> None:
+        keep = int(str(self.query_one("#backup-keep", Select).value))
+        if not keep:
+            self.notify("Set a retention above 'Keep all' to prune", severity="warning")
+            return
+        removed = prune_backups(default_backup_dir(self.server.container), keep)
+        for old in removed:
+            self._log(f"[dim]Pruned {old.name}[/]")
+        self._refresh_backup_list()
+        self.notify(f"Pruned {len(removed)} backup(s)")
+
+    @on(Button.Pressed, "#backup-restore")
+    def show_restore(self) -> None:
+        log = self.query_one("#backup-log", RichLog)
+        log.clear()
+        for line in restore_procedure(self.server.container).splitlines():
+            log.write(line)
+
+    @on(Button.Pressed, "#backup-close")
+    def close(self) -> None:
+        self.dismiss(None)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class MinecraftAdminApp(App[None]):
     TITLE = "Minecraft Admin"
     SUB_TITLE = "Server cockpit"
@@ -136,21 +329,40 @@ class MinecraftAdminApp(App[None]):
         align-vertical: middle;
     }
 
-    #server-label {
-        width: 16;
-        content-align: left middle;
-        color: #7ee787;
-        text-style: bold;
-    }
-
     #server-select {
         width: 1fr;
+    }
+
+    #server-scan {
+        width: 12;
         margin-right: 1;
     }
 
-    #server-scan, #server-add {
+    #server-add {
         width: 12;
         margin-left: 1;
+    }
+
+    #server-info-bar {
+        height: auto;
+        padding: 0 1;
+        margin-bottom: 1;
+        background: #161b22;
+        border-bottom: solid #30363d;
+        align-vertical: middle;
+    }
+
+    #server-info {
+        width: 1fr;
+        height: auto;
+        min-height: 5;
+        padding: 1 2;
+        color: #e6edf3;
+    }
+
+    #open-backups {
+        width: 14;
+        min-height: 3;
     }
 
     #context-bar {
@@ -207,7 +419,7 @@ class MinecraftAdminApp(App[None]):
         min-width: 16;
     }
 
-    #player-summary, #world-status, #server-status {
+    #player-summary, #world-status, #server-status, #backup-status {
         height: auto;
         min-height: 4;
         border: round #30363d;
@@ -217,6 +429,27 @@ class MinecraftAdminApp(App[None]):
 
     #item-search {
         margin-bottom: 0;
+    }
+
+    #kit-select {
+        width: 1fr;
+        margin-right: 1;
+    }
+
+    #kit-name {
+        width: 32;
+        margin-top: 1;
+    }
+
+    #kit-items {
+        margin-top: 1;
+    }
+
+    #kit-log {
+        height: 1fr;
+        min-height: 6;
+        border: round #30363d;
+        margin-top: 1;
     }
 
     #matches {
@@ -236,7 +469,8 @@ class MinecraftAdminApp(App[None]):
         padding-top: 1;
     }
 
-    #give-row, #coords-row, #location-row, #raw-row, #restart-row {
+    #give-row, #coords-row, #location-row, #raw-row, #restart-row,
+    #backup-row, #backup-list-row, #kit-row, #kit-save-row {
         height: auto;
         margin-top: 1;
     }
@@ -279,6 +513,46 @@ class MinecraftAdminApp(App[None]):
         margin-right: 1;
     }
 
+    #backup-body {
+        width: 90%;
+        height: auto;
+        max-height: 90%;
+        padding: 1 2;
+        background: #161b22;
+        border: round #30363d;
+    }
+
+    #backup-body .section-title {
+        margin-top: 0;
+    }
+
+    #backup-world, #backup-existing {
+        width: 1fr;
+        margin-right: 1;
+    }
+
+    #backup-label {
+        width: 24;
+        margin-right: 1;
+    }
+
+    #backup-keep {
+        width: 16;
+        margin-right: 1;
+    }
+
+    #backup-log {
+        height: 12;
+        border: round #30363d;
+        margin-top: 1;
+    }
+
+    #inventory-log {
+        height: 8;
+        border: round #30363d;
+        margin-bottom: 1;
+    }
+
     #server-log {
         height: 1fr;
         min-height: 10;
@@ -303,9 +577,22 @@ class MinecraftAdminApp(App[None]):
 
     BINDINGS = [
         ("ctrl+r", "refresh_players", "Refresh players"),
-        ("ctrl+s", "scan_servers", "Scan servers"),
-        ("ctrl+g", "give", "Give"),
-        ("ctrl+f", "focus_search", "Search"),
+        Binding("alt+r", "scan_servers", "Rescan servers", priority=True),
+        # Tab jumps: single letter, plus Ctrl+letter and Alt+letter (Option on mac).
+        # priority=True lets them beat widget bindings while focus is outside a
+        # text field; inside an Input/TextArea the letter must reach the field.
+        Binding("g,ctrl+g,alt+g", "show_tab('give-tab')", "Give", priority=True),
+        Binding("k,ctrl+k,alt+k", "show_tab('kits-tab')", "Kits", priority=True),
+        Binding(
+            "t,ctrl+t,alt+t", "show_tab('teleport-tab')", "Teleport", priority=True
+        ),
+        Binding("w,ctrl+w,alt+w", "show_tab('world-tab')", "World", priority=True),
+        Binding("s,ctrl+s,alt+s", "show_tab('server-tab')", "Server", priority=True),
+        Binding("b,ctrl+b,alt+b", "open_backups", "Backups", priority=True),
+        Binding(
+            "a,ctrl+a,alt+a", "show_tab('activity-tab')", "Activity", priority=True
+        ),
+        Binding("f,ctrl+f,alt+f", "show_tab('fun-tab')", "Fun", priority=True),
         ("q", "quit", "Quit"),
     ]
 
@@ -325,20 +612,24 @@ class MinecraftAdminApp(App[None]):
         self.online_players: list[str] = []
         self.snapshot: PlayerSnapshot | None = None
         self.locations: dict[str, Location] = {}
+        self.kits: dict[str, Kit] = all_kits()
+        self.inventory: list[tuple[int, int, str]] = []
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical(id="app-body"):
             with Horizontal(id="server-bar"):
-                yield Label("SERVER: none", id="server-label")
+                yield Button("Scan", id="server-scan")
                 yield Select(
                     [],
                     prompt="No server selected",
                     allow_blank=True,
                     id="server-select",
                 )
-                yield Button("Scan", id="server-scan")
                 yield Button("Add", id="server-add")
+            with Horizontal(id="server-info-bar"):
+                yield Static("No server selected.", id="server-info")
+                yield Button("Backups", id="open-backups")
             with Horizontal(id="context-bar"):
                 yield Label("TARGET: none", id="target-label")
                 yield Select(
@@ -349,9 +640,11 @@ class MinecraftAdminApp(App[None]):
                 )
                 yield Button("Refresh", id="refresh-players")
 
-            with TabbedContent(initial="players-tab"):
-                with TabPane("Players", id="players-tab"):
+            with TabbedContent(initial="player-tab"):
+                with TabPane("Player", id="player-tab"):
                     yield Static("No active player selected.", id="player-summary")
+                    yield Label("INVENTORY", classes="section-title")
+                    yield RichLog(id="inventory-log", markup=True, wrap=True)
                     yield Label(
                         "The selected player remains the target as you move between tabs.",
                         classes="help",
@@ -383,6 +676,34 @@ class MinecraftAdminApp(App[None]):
                             id="give-item",
                             variant="primary",
                         )
+
+                with TabPane("Kits", id="kits-tab"):
+                    yield Label(
+                        "Give a bundle of items at once. Built-ins are read-only; "
+                        "custom kits are saved to ~/.config/mc-admin-tui/kits.json.",
+                        classes="help",
+                    )
+                    with Horizontal(id="kit-row"):
+                        yield Select(
+                            [],
+                            prompt="No kits",
+                            allow_blank=True,
+                            id="kit-select",
+                        )
+                        yield Button("Give kit", id="kit-give", variant="primary")
+                        yield Button("Delete kit", id="kit-delete")
+                    yield Label("NEW / EDIT KIT", classes="section-title")
+                    yield Input(
+                        placeholder="KIT NAME  (e.g. mining)",
+                        id="kit-name",
+                    )
+                    yield Input(
+                        placeholder="items — e.g. diamond_pickaxe, torch 64, cobblestone 64",
+                        id="kit-items",
+                    )
+                    with Horizontal(id="kit-save-row"):
+                        yield Button("Save kit", id="kit-save", variant="primary")
+                    yield RichLog(id="kit-log", markup=True, wrap=True)
 
                 with TabPane("Teleport", id="teleport-tab"):
                     yield Label("PLAYER → PLAYER", classes="section-title")
@@ -509,6 +830,7 @@ class MinecraftAdminApp(App[None]):
         )
         self._update_matches("")
         self._update_location_options()
+        self._update_kit_options()
         if self.config is not None:
             self._activate_server(self.config)
         self.scan_servers()
@@ -522,12 +844,78 @@ class MinecraftAdminApp(App[None]):
             self.locations = load_locations(config.locations_path)
         else:
             self.locations = load_locations(DEFAULT_LOCATIONS)
-        self.query_one("#server-label", Label).update(f"SERVER: {config.label}")
+        self._refresh_server_info()
         self._update_location_options()
         upsert_server_config(config)
         self.refresh_players()
         self.refresh_server_status()
         self.refresh_world_status()
+
+    @work(thread=True, exclusive=True, group="server-info-bar")
+    def _refresh_server_info(self) -> None:
+        if self.config is None:
+            return
+        try:
+            level = container_level_name(self.config)
+            stats = server_stats(self.config, level)
+        except Exception as exc:
+            self.call_from_thread(self._apply_server_info, None, str(exc))
+            return
+        self.call_from_thread(self._apply_server_info, stats, None)
+
+    def _apply_server_info(self, stats: dict | None, error: str | None) -> None:
+        widget = self.query_one("#server-info", Static)
+        if self.config is None:
+            widget.update("No server selected.")
+            return
+        if error or stats is None:
+            widget.update(f"{self.config.label}\nInfo unavailable: {error}")
+            return
+        version = stats.get("version") or "unknown"
+        state = "running" if stats.get("running") else "stopped"
+        uptime = stats.get("uptime") or ""
+        if stats.get("running") and not uptime:
+            uptime = "unknown"
+        players = stats.get("players")
+        if stats.get("running"):
+            if players is None:
+                players_text = "unavailable"
+            else:
+                max_players = stats.get("max_players") or "?"
+                players_text = f"{len(players)}/{max_players}"
+        else:
+            players_text = "—"
+        size = human_size(stats.get("world_size"))
+        lines = [
+            f"[b]{self.config.label}[/b]  ·  {self.config.runtime}",
+            f"[dim]{stats.get('image', '')}[/]",
+            f"MC {version}   ·   {state}"
+            + (f"   ·   uptime {uptime}" if uptime else ""),
+            f"Players {players_text}   ·   World {size}",
+        ]
+        if stats.get("motd"):
+            lines.append(f"[dim]motd: {stats['motd']}[/]")
+        widget.update("\n".join(lines))
+
+    def _server_options(self) -> list[tuple[Text, str]]:
+        """Picker options, running servers first; stopped servers dimmed."""
+        ordered = sorted(
+            self.discovered,
+            key=lambda s: (
+                0 if s.state == "running" else 1,
+                s.container.casefold(),
+                s.runtime,
+            ),
+        )
+        options: list[tuple[Text, str]] = []
+        for server in ordered:
+            label = Text(
+                f"{server.container}  ({server.runtime}, {server.state or 'unknown'})"
+            )
+            if server.state != "running":
+                label.stylize("#6e7681")
+            options.append((label, f"{server.runtime}:{server.container}"))
+        return options
 
     @work(thread=True, exclusive=True, group="scan")
     def scan_servers(self) -> None:
@@ -540,19 +928,13 @@ class MinecraftAdminApp(App[None]):
     def _apply_scan(self, servers: list[DiscoveredServer], error: str | None) -> None:
         self.discovered = servers
         select = self.query_one("#server-select", Select)
-        options = [
-            (
-                f"{server.container}  ({server.runtime}, {server.state or 'unknown'})",
-                f"{server.runtime}:{server.container}",
-            )
-            for server in servers
-        ]
+        options = self._server_options()
         select.set_options(options)
         select.prompt = f"{len(servers)} server(s) found" if servers else "No servers found"
 
-        label = self.query_one("#server-label", Label)
+        info = self.query_one("#server-info", Static)
         if error:
-            label.update("SERVER: scan failed")
+            info.update("Server scan failed.")
             self._log(f"[red]Server scan failed:[/] {error}")
             return
         self._log(
@@ -636,15 +1018,7 @@ class MinecraftAdminApp(App[None]):
         config = server_config_for(server)
         upsert_server_config(config)
         select = self.query_one("#server-select", Select)
-        select.set_options(
-            [
-                (
-                    f"{item.container}  ({item.runtime}, {item.state or 'unknown'})",
-                    f"{item.runtime}:{item.container}",
-                )
-                for item in self.discovered
-            ]
-        )
+        select.set_options(self._server_options())
         select.value = f"{runtime}:{container}"
         self._activate_server(config)
         self._log(f"[green]✓[/] Added server {container} ({runtime})")
@@ -707,6 +1081,7 @@ class MinecraftAdminApp(App[None]):
             self.query_one("#player-summary", Static).update(
                 "No active player selected."
             )
+            self.query_one("#inventory-log", RichLog).clear()
 
         select.prompt = "No active players" if not players else "Select player"
         self._update_teleport_player_options()
@@ -729,11 +1104,22 @@ class MinecraftAdminApp(App[None]):
     def action_refresh_players(self) -> None:
         self.refresh_players()
 
-    def action_focus_search(self) -> None:
-        self.query_one("#item-search", Input).focus()
+    def action_show_tab(self, tab_id: str) -> None:
+        # A focused widget keeps re-asserting its own pane via
+        # TabPane._on_descendant_focus, which would revert the switch; drop focus
+        # first so the new pane can take it.
+        self.set_focus(None)
+        self.query_one(TabbedContent).active = tab_id
 
-    def action_give(self) -> None:
-        self._give_current_item()
+    def action_open_backups(self) -> None:
+        if self.config is None:
+            self.notify("Select a server first", severity="warning")
+            return
+        self.push_screen(BackupScreen(self.config))
+
+    @on(Button.Pressed, "#open-backups")
+    def open_backups_pressed(self) -> None:
+        self.action_open_backups()
 
     @work(thread=True, exclusive=True, group="snapshot")
     def refresh_selected_player(self) -> None:
@@ -742,9 +1128,28 @@ class MinecraftAdminApp(App[None]):
             return
         try:
             snapshot = query_player_snapshot(self.config, player)
+            inventory = query_player_inventory(self.config, player)
             self.call_from_thread(self._apply_snapshot, snapshot, None)
+            self.call_from_thread(self._apply_inventory, inventory, None)
         except Exception as exc:
             self.call_from_thread(self._apply_snapshot, None, str(exc))
+            self.call_from_thread(self._apply_inventory, None, str(exc))
+
+    def _apply_inventory(
+        self, inventory: list[tuple[int, int, str]] | None, error: str | None
+    ) -> None:
+        log = self.query_one("#inventory-log", RichLog)
+        log.clear()
+        if error:
+            log.write(f"Inventory unavailable: {error}")
+            return
+        self.inventory = inventory or []
+        if not self.inventory:
+            log.write("Inventory empty.")
+            return
+        for slot, count, item_id in sorted(self.inventory):
+            suffix = f" ×{count}" if count > 1 else ""
+            log.write(f"[dim]{slot:>2}[/]  {human_name(item_id)}[b]{suffix}[/]")
 
     def _apply_snapshot(
         self, snapshot: PlayerSnapshot | None, error: str | None
@@ -937,6 +1342,127 @@ class MinecraftAdminApp(App[None]):
             False,
         )
 
+    def _update_kit_options(self) -> None:
+        select = self.query_one("#kit-select", Select)
+        self.kits = all_kits()
+        options = [
+            (f"{name}  ({len(kit.items)} items)", name)
+            for name, kit in sorted(self.kits.items())
+        ]
+        select.set_options(options)
+        select.prompt = f"{len(options)} kit(s)" if options else "No kits"
+
+    def _kit_log(self, message: str) -> None:
+        self.query_one("#kit-log", RichLog).write(message)
+
+    @on(Button.Pressed, "#kit-give")
+    def kit_give(self) -> None:
+        player = self._require_player()
+        if not player:
+            return
+        name = self.query_one("#kit-select", Select).value
+        if not isinstance(name, str) or name not in self.kits:
+            self.notify("Choose a kit", severity="warning")
+            return
+        self.kit_give_worker(player, name)
+
+    @work(thread=True, exclusive=True, group="kit")
+    def kit_give_worker(self, player: str, name: str) -> None:
+        config = self.config
+        kit = self.kits.get(name)
+        if config is None or kit is None:
+            return
+        given = 0
+        errors: list[str] = []
+        given_items: list[str] = []
+        for entry, qty in kit.items:
+            # Entries containing a space are commands (e.g. `gamerule x true`);
+            # otherwise they are item ids given `qty` at a time.
+            try:
+                if " " in entry:
+                    rcon(config, entry)
+                    given_items.append(entry)
+                else:
+                    rcon(config, f"give {player} {entry} {qty}")
+                    given_items.append(f"{human_name(entry)} ×{qty}")
+                given += 1
+            except Exception as exc:
+                errors.append(f"{entry}: {exc}")
+        total = len(kit.items)
+        self.call_from_thread(
+            self._kit_give_finished,
+            player,
+            name,
+            total,
+            errors,
+            given_items,
+            total - given,
+        )
+
+    def _kit_give_finished(
+        self,
+        player: str,
+        name: str,
+        total: int,
+        errors: list[str],
+        given_items: list[str],
+        failed: int,
+    ) -> None:
+        for item in given_items:
+            self._kit_log(f"[green]✓[/] {item}")
+        if errors:
+            self._kit_log(
+                f"[yellow]Kit {name} → {player}: {len(given_items)}/{total} items given[/]"
+            )
+            for message in errors:
+                self._kit_log(f"[red]  {message}[/]")
+            self.notify(
+                f"Kit {name} → {player}: {len(given_items)}/{total} given "
+                f"({failed} failed)",
+                severity="warning",
+            )
+            return
+        summary = ", ".join(given_items)
+        self._kit_log(f"[green]✓[/] Kit {name} → {player}: {summary}")
+        self._log(f"[green]✓[/] Gave kit {name} to {player}: {summary}")
+        self.notify(f"Gave kit {name} to {player}: {summary}")
+
+    @on(Button.Pressed, "#kit-delete")
+    def kit_delete(self) -> None:
+        name = self.query_one("#kit-select", Select).value
+        if not isinstance(name, str) or name not in self.kits:
+            self.notify("Choose a kit", severity="warning")
+            return
+        if self.kits[name].source != "custom":
+            self.notify(f"{name} is a built-in kit and cannot be deleted", severity="warning")
+            return
+        custom = load_custom_kits()
+        custom.pop(name, None)
+        save_custom_kits(custom)
+        self._update_kit_options()
+        self._kit_log(f"[yellow]Deleted kit[/] {name}")
+        self.notify(f"Deleted {name}")
+
+    @on(Button.Pressed, "#kit-save")
+    def kit_save(self) -> None:
+        name = self.query_one("#kit-name", Input).value.strip()
+        if not name:
+            self.notify("Give the kit a name", severity="warning")
+            return
+        items = parse_kit_items(self.query_one("#kit-items", Input).value)
+        if not items:
+            self.notify("Add at least one item", severity="warning")
+            return
+        custom = load_custom_kits()
+        custom[name] = Kit(name=name, items=items, source="custom")
+        save_custom_kits(custom)
+        self._update_kit_options()
+        self.query_one("#kit-select", Select).value = name
+        self.query_one("#kit-name", Input).value = ""
+        self.query_one("#kit-items", Input).value = ""
+        self._kit_log(f"[green]✓[/] Saved kit [b]{name}[/b] ({len(items)} items)")
+        self.notify(f"Saved kit {name}")
+
     @on(Button.Pressed, "#tp-player")
     def teleport_to_player(self) -> None:
         player = self._require_player()
@@ -1058,19 +1584,22 @@ class MinecraftAdminApp(App[None]):
         if self.config is None:
             return
         try:
-            value = rcon(self.config, "gamerule keepInventory")
-            self.call_from_thread(self._apply_world_status, value, None)
+            name = rule_name(self.config, "keepInventory")
+            value = rcon(self.config, f"gamerule {name}")
+            self.call_from_thread(self._apply_world_status, name, value, None)
         except Exception as exc:
-            self.call_from_thread(self._apply_world_status, "", str(exc))
+            self.call_from_thread(self._apply_world_status, "keepInventory", "", str(exc))
 
-    def _apply_world_status(self, value: str, error: str | None) -> None:
+    def _apply_world_status(
+        self, name: str, value: str, error: str | None
+    ) -> None:
         if error:
             self.query_one("#world-status", Static).update(
                 f"World status unavailable: {error}"
             )
         else:
             self.query_one("#world-status", Static).update(
-                f"[b]keepInventory[/b]\n{value}"
+                f"[b]{name}[/b]\n{value}"
             )
 
     @on(Button.Pressed, "#world-refresh")
@@ -1079,16 +1608,25 @@ class MinecraftAdminApp(App[None]):
 
     def _world_action(self, label: str, command: str) -> None:
         self.run_rcon_action(label, command, False)
-        if command.startswith("gamerule keepInventory"):
+        if "keep_inventory" in command or "keepInventory" in command:
             self.set_timer(0.5, self.refresh_world_status)
+
+    def _set_keep_inventory(self, value: bool) -> None:
+        if self.config is None:
+            return
+        name = rule_name(self.config, "keepInventory")
+        self._world_action(
+            f"{name} enabled" if value else f"{name} disabled",
+            f"gamerule {name} {'true' if value else 'false'}",
+        )
 
     @on(Button.Pressed, "#keepinv-on")
     def keepinv_on(self) -> None:
-        self._world_action("keepInventory enabled", "gamerule keepInventory true")
+        self._set_keep_inventory(True)
 
     @on(Button.Pressed, "#keepinv-off")
     def keepinv_off(self) -> None:
-        self._world_action("keepInventory disabled", "gamerule keepInventory false")
+        self._set_keep_inventory(False)
 
     @on(Button.Pressed, "#time-day")
     def time_day(self) -> None:

@@ -1,19 +1,113 @@
 from __future__ import annotations
 
+import gzip
+import io
 import json
 import re
 import shutil
 import subprocess
+import tarfile
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 APP_DIR = Path.home() / ".config" / "mc-admin-tui"
 CACHE_DIR = Path.home() / ".cache" / "mc-admin-tui"
+BACKUP_DIR = Path.home() / "minecraft-backups"
 DEFAULT_ITEM_CACHE = CACHE_DIR / "items.json"
 DEFAULT_LOCATIONS = APP_DIR / "locations.json"
 LEGACY_LOCATIONS = APP_DIR / "locations.legacy.json"
 DEFAULT_SERVERS = APP_DIR / "servers.json"
+DEFAULT_KITS = APP_DIR / "kits.json"
+
+BUILTIN_KITS: dict[str, tuple[tuple[str, int], ...]] = {
+    "starter": (
+        ("minecraft:torch", 64),
+        ("minecraft:oak_log", 32),
+        ("minecraft:cobblestone", 64),
+        ("minecraft:crafting_table", 1),
+        ("minecraft:furnace", 1),
+        ("minecraft:cooked_beef", 32),
+    ),
+    "tools": (
+        ("minecraft:netherite_pickaxe", 1),
+        ("minecraft:netherite_axe", 1),
+        ("minecraft:netherite_shovel", 1),
+        ("minecraft:netherite_sword", 1),
+        ("minecraft:shield", 1),
+    ),
+    "nether": (
+        ("minecraft:netherite_ingot", 4),
+        ("minecraft:obsidian", 10),
+        ("minecraft:flint_and_steel", 1),
+        ("minecraft:golden_apple", 8),
+        ("minecraft:ender_pearl", 16),
+    ),
+    "pvp": (
+        ("minecraft:netherite_sword", 1),
+        ("minecraft:bow", 1),
+        ("minecraft:arrow", 64),
+        ("minecraft:golden_apple", 32),
+        ("minecraft:ender_pearl", 16),
+        ("minecraft:totem_of_undying", 1),
+    ),
+    "food": (
+        ("minecraft:cooked_beef", 64),
+        ("minecraft:golden_carrot", 64),
+        ("minecraft:bread", 64),
+        ("minecraft:golden_apple", 16),
+    ),
+    # Enchanted gear uses item components; values are passed straight to `give`.
+    "swimming": (
+        (
+            'minecraft:turtle_helmet[enchantments={"minecraft:protection":4,'
+            '"minecraft:respiration":3,"minecraft:aqua_affinity":1,'
+            '"minecraft:unbreaking":3,"minecraft:mending":1}]',
+            1,
+        ),
+        (
+            'minecraft:netherite_chestplate[enchantments={"minecraft:protection":4,'
+            '"minecraft:unbreaking":3,"minecraft:mending":1}]',
+            1,
+        ),
+        (
+            'minecraft:netherite_leggings[enchantments={"minecraft:protection":4,'
+            '"minecraft:swift_sneak":3,"minecraft:unbreaking":3,'
+            '"minecraft:mending":1}]',
+            1,
+        ),
+        (
+            'minecraft:netherite_boots[enchantments={"minecraft:protection":4,'
+            '"minecraft:depth_strider":3,"minecraft:feather_falling":4,'
+            '"minecraft:unbreaking":3,"minecraft:mending":1}]',
+            1,
+        ),
+        (
+            'minecraft:trident[enchantments={"minecraft:riptide":3,'
+            '"minecraft:impaling":5,"minecraft:unbreaking":3,'
+            '"minecraft:mending":1}]',
+            1,
+        ),
+        (
+            'minecraft:trident[enchantments={"minecraft:loyalty":3,'
+            '"minecraft:channeling":1,"minecraft:impaling":5,'
+            '"minecraft:unbreaking":3,"minecraft:mending":1}]',
+            1,
+        ),
+        (
+            'minecraft:potion[minecraft:potion_contents='
+            '{potion:"minecraft:long_water_breathing"}]',
+            6,
+        ),
+        (
+            'minecraft:potion[minecraft:potion_contents='
+            '{potion:"minecraft:long_night_vision"}]',
+            6,
+        ),
+        ("minecraft:golden_carrot", 64),
+    ),
+}
 
 RUNTIME_BINARIES = {"podman": "podman", "docker": "docker"}
 RUNTIME_ORDER = ("podman", "docker")
@@ -131,6 +225,13 @@ class Location:
     y: float
     z: float
     dimension: str = "minecraft:overworld"
+
+
+@dataclass(frozen=True)
+class Kit:
+    name: str
+    items: tuple[tuple[str, int], ...]
+    source: str = "custom"
 
 
 def run_process(args: list[str], *, timeout: int = 10) -> str:
@@ -396,10 +497,182 @@ def restart_container(server: ServerConfig) -> str:
     return container_command(server, "restart", timeout=90)
 
 
+def server_stats(server: ServerConfig, level_name: str = "world") -> dict:
+    """Best-effort server metadata: MC version, uptime, players, world size, motd."""
+    stats: dict = {}
+    running = False
+    started_at = None
+    try:
+        info = inspect_container(server.runtime, server.container)
+        state = info.get("State") or {}
+        running = str(state.get("Status") or "").lower() == "running"
+        started_at = state.get("StartedAt") or None
+        stats["image"] = container_image(info)
+    except (RuntimeError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
+        stats["error"] = str(exc)
+        return stats
+
+    stats["running"] = running
+    stats["started_at"] = started_at
+
+    try:
+        props = _properties_from_tar(_copy_path_stream(server, "/data/server.properties"))
+    except (RuntimeError, subprocess.SubprocessError):
+        props = {}
+    stats["motd"] = props.get("motd", "")
+    stats["max_players"] = props.get("max-players", "")
+
+    mcxbox = None
+    try:
+        mcxbox = _properties_from_tar(
+            _copy_path_stream(server, "/data/config/mcxbox.properties")
+        )
+    except (RuntimeError, subprocess.SubprocessError):
+        mcxbox = None
+    if mcxbox and (mcxbox.get("MOTD") or mcxbox.get("VERSION")):
+        stats["message"] = mcxbox.get("MOTD", "")
+        stats["version"] = mcxbox.get("VERSION", "")
+    else:
+        stats["message"] = ""
+        stats["version"] = _version_from_container(server)
+
+    if running:
+        try:
+            listing = rcon(server, "list")
+            online = parse_players(listing)
+            match = re.search(
+                r"of a max of (\d+) players online", listing, re.IGNORECASE
+            )
+            stats["players"] = online
+            stats["max_players"] = match.group(1) if match else props.get(
+                "max-players", ""
+            )
+        except Exception:
+            stats["players"] = None
+    else:
+        stats["players"] = None
+
+    try:
+        stats["world_size"] = world_size_bytes(server, level_name)
+    except (RuntimeError, subprocess.SubprocessError):
+        stats["world_size"] = None
+
+    if started_at:
+        stats["uptime"] = _uptime_text(started_at)
+    return stats
+
+
+def _uptime_text(started_at: str) -> str:
+    try:
+        parsed = datetime.fromisoformat(started_at)
+    except ValueError:
+        return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    delta = datetime.now(timezone.utc) - parsed
+    seconds = int(delta.total_seconds())
+    if seconds < 0:
+        return ""
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return " ".join(parts)
+
+
+def _version_from_container(server: ServerConfig) -> str:
+    """Read the reported MC version from the itzg env or server.properties."""
+    try:
+        env = container_env(inspect_container(server.runtime, server.container))
+    except (RuntimeError, json.JSONDecodeError, subprocess.SubprocessError):
+        env = {}
+    if env.get("VERSION"):
+        return env["VERSION"]
+    try:
+        props = _properties_from_tar(
+            _copy_path_stream(server, "/data/server.properties")
+        )
+    except (RuntimeError, subprocess.SubprocessError):
+        return ""
+    # Vanilla jars write the version into the properties as a comment line.
+    for line in props.get("_raw", "").splitlines():
+        match = re.search(r"version[= ]+([0-9][\w.\-]*)", line, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def container_running(server: ServerConfig) -> bool:
+    try:
+        info = inspect_container(server.runtime, server.container)
+    except (RuntimeError, json.JSONDecodeError, subprocess.SubprocessError):
+        return False
+    return str((info.get("State") or {}).get("Status") or "").lower() == "running"
+
+
+def world_size_bytes(server: ServerConfig, level_name: str = "world") -> int | None:
+    """World size in bytes.
+
+    Running containers use `du -sb` (cheap, one syscall pass). Stopped containers
+    cannot be exec'd, so the tar stream is counted instead — correct but O(size).
+    """
+    if container_running(server):
+        try:
+            output = run_process(
+                [
+                    runtime_binary(server.runtime),
+                    "exec",
+                    server.container,
+                    "du",
+                    "-sb",
+                    f"/data/{level_name}",
+                ],
+                timeout=30,
+            )
+            return int(output.split()[0])
+        except (RuntimeError, ValueError, subprocess.SubprocessError):
+            return None
+
+    argv = [
+        runtime_binary(server.runtime),
+        "cp",
+        f"{server.container}:/data/{level_name}",
+        "-",
+    ]
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    assert proc.stdout is not None
+    total = 0
+    while chunk := proc.stdout.read(1 << 20):
+        total += len(chunk)
+    proc.wait()
+    return total if proc.returncode == 0 else None
+
+
+def human_size(count: int | None) -> str:
+    if not count:
+        return "?"
+    value = float(count)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TB"
+
+
 def human_name(item_id: str) -> str:
-    namespace, _, path = item_id.partition(":")
+    """Readable label for an item id, tolerating component suffixes like [enchantments=…]."""
+    base, _, components = item_id.partition("[")
+    namespace, _, path = base.partition(":")
     words = path.replace("_", " ").replace("/", " / ")
-    return words if namespace == "minecraft" else f"{words}  [{namespace}]"
+    name = words if namespace == "minecraft" else f"{words}  [{namespace}]"
+    if components:
+        name = f"{name} [+components]"
+    return name
 
 
 def search_key(value: str) -> str:
@@ -519,6 +792,37 @@ def parse_dimension(output: str) -> str | None:
     payload = _data_payload(output).strip().strip('"')
     match = re.search(r"minecraft:[a-z0-9_]+", payload)
     return match.group(0) if match else (payload or None)
+
+
+def parse_inventory(output: str) -> list[tuple[int, int, str]]:
+    """Parse `data get entity <p> Inventory` semi-NBT into (slot, count, item id).
+
+    Item entries carry nested `components` maps, so whole-entry brace matching is
+    unreliable; anchor on each `id` and read the nearest preceding `count`/`Slot`.
+    """
+    payload = _data_payload(output)
+    if "has no items" in payload:
+        return []
+    entries: list[tuple[int, int, str]] = []
+    for match in re.finditer(r'id:\s*"([^"]+)"', payload):
+        item_id = match.group(1)
+        before = payload[: match.start()]
+        slot = None
+        for slot_match in re.finditer(r"Slot:\s*(-?\d+)b", before):
+            slot = int(slot_match.group(1))
+        if slot is None:
+            continue
+        count = 1
+        for count_match in re.finditer(r"(?<![\w:])count:\s*(\d+)", before):
+            count = int(count_match.group(1))
+        entries.append((slot, count, item_id))
+    return entries
+
+
+def query_player_inventory(
+    server: ServerConfig, player: str
+) -> list[tuple[int, int, str]]:
+    return parse_inventory(rcon(server, f"data get entity {player} Inventory"))
 
 
 def query_player_snapshot(server: ServerConfig, player: str) -> PlayerSnapshot:
@@ -650,3 +954,289 @@ def upsert_server_config(config: ServerConfig, path: Path = DEFAULT_SERVERS) -> 
     servers.sort(key=lambda item: (item["runtime"], item["container"]))
     payload = {"last": _server_to_dict(config), "servers": servers}
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def builtin_kits() -> list[Kit]:
+    return [
+        Kit(name=name, items=items, source="builtin")
+        for name, items in sorted(BUILTIN_KITS.items())
+    ]
+
+
+def load_custom_kits(path: Path = DEFAULT_KITS) -> dict[str, Kit]:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    entries = raw.get("kits", []) if isinstance(raw, dict) else raw
+    kits: dict[str, Kit] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("name"):
+            continue
+        items = tuple(
+            (str(pair[0]), int(pair[1]))
+            for pair in entry.get("items", [])
+            if isinstance(pair, (list, tuple)) and len(pair) == 2
+        )
+        if items:
+            kits[str(entry["name"])] = Kit(
+                name=str(entry["name"]), items=items, source="custom"
+            )
+    return kits
+
+
+def save_custom_kits(kits: dict[str, Kit], path: Path = DEFAULT_KITS) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "kits": [
+            {"name": kit.name, "items": [list(pair) for pair in kit.items]}
+            for kit in (kits[name] for name in sorted(kits))
+        ]
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def all_kits(path: Path = DEFAULT_KITS) -> dict[str, Kit]:
+    """Custom kits override built-ins of the same name."""
+    kits = {kit.name: kit for kit in builtin_kits()}
+    kits.update(load_custom_kits(path))
+    return kits
+
+
+def parse_kit_items(spec: str) -> tuple[tuple[str, int], ...]:
+    """Parse 'minecraft:stone 64, apple 5, diamond' into (item, qty) pairs."""
+    items: list[tuple[str, int]] = []
+    for chunk in re.split(r"[,\n]+", spec):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = chunk.rsplit(" ", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            item_id, qty = parts[0].strip(), int(parts[1])
+        else:
+            item_id, qty = chunk, 1
+        if not item_id:
+            continue
+        if ":" not in item_id:
+            item_id = f"minecraft:{item_id}"
+        items.append((item_id, max(1, min(qty, 6400))))
+    return tuple(items)
+
+
+def restore_procedure(container: str) -> str:
+    """Manual restore steps, shown in the Backups modal (no automated restore UI)."""
+    return f"""\
+Restore is manual — order matters.
+
+  C={container}
+  A=~/minecraft-backups/$C/<world>-<stamp>[-label].tar.gz
+
+1. Stop the server (never restore under a live server).
+     <runtime> stop $C
+2. Find the host path backing /data:
+     VOL=$(<runtime> inspect --format '{{{{range .Mounts}}}}{{{{if eq .Destination "/data"}}}}{{{{.Source}}}}{{{{end}}}}{{{{end}}}}' $C)
+3. Move the old world aside, then extract at the PARENT of the world dir:
+     mv "$VOL/<world>" "$VOL/<world>.bak.$(date +%s)"
+     tar -xzf "$A" -C "$VOL"
+4. Drop the stale lock vanilla refuses to load past:
+     rm -f "$VOL/<world>/session.lock"
+5. Start it:
+     <runtime> start $C
+
+Notes:
+- Extract at /data (the parent), not into <world>/ — else you get <world>/<world>/.
+- The archive's top dir is the level-name at backup time; keep it matching the
+  server's current level-name (rename if the world was renamed).
+- A live snapshot can capture session.lock; deleting it (and optionally
+  level.dat_old) is what stops "world is locked".
+- Inspect first: tar -tzf "$A" | head
+- If /data is a rootful/system volume outside your home, extraction needs matching
+  permissions — step 2 prints the path so you can check first.
+"""
+
+
+def rule_name(server: ServerConfig, canonical: str) -> str:
+    """Resolve a canonical gamerule name to the spelling this server accepts.
+
+    Gamerule spelling varies (camelCase in older/other builds, snake_case in newer
+    ones) and `gamerule` with no argument is not a valid listing command, so each
+    candidate is queried and the first that returns a value wins.
+    """
+    snake = re.sub(r"(?<!^)(?=[A-Z])", "_", canonical).lower()
+    for candidate in dict.fromkeys((canonical, snake)):
+        try:
+            output = rcon(server, f"gamerule {candidate}")
+        except Exception:
+            continue
+        lowered = output.lower()
+        if "incorrect" in lowered or "unknown" in lowered or "usage" in lowered:
+            continue
+        if "game rule" in lowered or "currently set" in lowered:
+            return candidate
+    return canonical
+
+
+def _properties_from_tar(buf: bytes, member_name: str = "server.properties") -> dict:
+    """Parse a .properties file out of a tar stream into a dict (plus '_raw')."""
+    try:
+        with tarfile.open(fileobj=io.BytesIO(buf), mode="r:*") as archive:
+            member = next(
+                (m for m in archive.getmembers() if m.name.endswith(member_name)),
+                None,
+            )
+            if member is None:
+                return {}
+            content = archive.extractfile(member).read().decode("utf-8", "replace")
+    except (tarfile.TarError, OSError, AttributeError):
+        return {}
+
+    props: dict[str, str] = {"_raw": content}
+    for line in content.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition("=")
+        props[key.strip()] = value.strip()
+    return props
+
+
+def container_level_name(server: ServerConfig) -> str:
+    """Read level-name from server.properties, defaulting to 'world'."""
+    try:
+        buf = _copy_path_stream(server, "/data/server.properties")
+    except (RuntimeError, subprocess.SubprocessError):
+        return "world"
+    value = _properties_from_tar(buf).get("level-name", "")
+    return value or "world"
+
+
+def _copy_path_stream(server: ServerConfig, path: str) -> bytes:
+    """Stream a container path as a tar archive to memory (runtime-generic)."""
+    proc = subprocess.run(
+        [runtime_binary(server.runtime), "cp", f"{server.container}:{path}", "-"],
+        capture_output=True,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).decode("utf-8", "replace").strip()
+        raise RuntimeError(detail or f"{server.runtime} cp exited {proc.returncode}")
+    return proc.stdout
+
+
+def _container_has_path(server: ServerConfig, path: str) -> bool:
+    try:
+        return len(_copy_path_stream(server, path)) > 0
+    except (RuntimeError, subprocess.SubprocessError):
+        return False
+
+
+def discover_worlds(server: ServerConfig) -> list[str]:
+    """Find world directories inside the container's data volume.
+
+    Running containers are listed with a shell; stopped containers (where exec is
+    impossible) fall back to the level-name from server.properties, confirmed by
+    probing for its level.dat.
+    """
+    try:
+        listing = run_process(
+            [
+                runtime_binary(server.runtime),
+                "exec",
+                server.container,
+                "sh",
+                "-c",
+                'for d in /data/*/; do [ -f "${d}level.dat" ] && basename "$d"; done',
+            ],
+            timeout=20,
+        )
+    except (RuntimeError, subprocess.SubprocessError):
+        listing = ""
+    worlds = [line.strip() for line in listing.splitlines() if line.strip()]
+    if worlds:
+        return worlds
+
+    level = container_level_name(server)
+    if level and _container_has_path(server, f"/data/{level}/level.dat"):
+        return [level]
+    return []
+
+
+def default_backup_dir(container: str, base: Path = BACKUP_DIR) -> Path:
+    return base / safe_filename(container)
+
+
+def backup_path(
+    server: ServerConfig, *, level_name: str, when: datetime | None = None, label: str = ""
+) -> Path:
+    stamp = (when or datetime.now(timezone.utc)).strftime("%Y%m%d-%H%M%S")
+    suffix = f"-{safe_filename(label)}" if label else ""
+    directory = default_backup_dir(server.container)
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"{safe_filename(level_name)}-{stamp}{suffix}.tar.gz"
+
+
+def backup_world(
+    server: ServerConfig,
+    *,
+    level_name: str = "world",
+    label: str = "",
+    on_progress: Callable[[str], None] | None = None,
+    timeout: int = 900,
+) -> Path:
+    """Back up one world directory (all dimensions) to a gzipped tar.
+
+    Every world lives in a single directory (level-name); nether/end data is
+    nested under it, so one archive captures the full world. The path is streamed
+    out with `<runtime> cp ... -`, which works for running and stopped containers
+    alike and needs no shell inside the container beyond the initial level-name read.
+    """
+    log = on_progress or (lambda _message: None)
+    destination = backup_path(server, level_name=level_name, label=label)
+    source = f"/data/{level_name}"
+
+    log(f"Backing up {source} from {server.container} …")
+    argv = [
+        runtime_binary(server.runtime),
+        "cp",
+        f"{server.container}:{source}",
+        "-",
+    ]
+    with destination.open("wb") as raw:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, compresslevel=6) as gz:
+            proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            assert proc.stdout is not None
+            while chunk := proc.stdout.read(1 << 20):
+                gz.write(chunk)
+            _, stderr = proc.communicate(timeout=timeout)
+    if proc.returncode != 0:
+        destination.unlink(missing_ok=True)
+        detail = (stderr or b"").decode("utf-8", "replace").strip()
+        raise RuntimeError(detail or f"{server.runtime} cp exited {proc.returncode}")
+
+    size = destination.stat().st_size
+    log(f"Wrote {destination.name} ({size / 1e6:.1f} MB)")
+    return destination
+
+
+def prune_backups(directory: Path, keep: int) -> list[Path]:
+    """Delete oldest backups beyond the newest `keep`; returns the deleted paths.
+
+    `keep` <= 0 disables pruning (retain everything).
+    """
+    if keep <= 0:
+        return []
+    archives = sorted(directory.glob("*.tar.gz"))
+    removed = []
+    for path in archives[: max(0, len(archives) - keep)]:
+        path.unlink(missing_ok=True)
+        removed.append(path)
+    return removed
+
+
+def list_backups(container: str, base: Path = BACKUP_DIR) -> list[Path]:
+    directory = default_backup_dir(container, base)
+    if not directory.exists():
+        return []
+    # Names carry a sortable UTC timestamp, so newest-first is name-descending.
+    return sorted(directory.glob("*.tar.gz"), reverse=True)
