@@ -1290,12 +1290,23 @@ class MinecraftAdminApp(App[None]):
             self.locations = load_locations(config.locations_path)
         else:
             self.locations = load_locations(DEFAULT_LOCATIONS)
+        self._sync_server_picker()
         self._refresh_server_info()
         self._update_location_options()
         upsert_server_config(config)
         self.refresh_players()
         self.refresh_server_status()
         self.refresh_world_status()
+
+    def _sync_server_picker(self) -> None:
+        """Point the server picker at the active server so it shows when collapsed."""
+        if self.config is None:
+            return
+        select = self.query_one("#server-select", Select)
+        selected = f"{self.config.runtime}:{self.config.container}"
+        select.value = selected if any(
+            value == selected for _, value in self._server_options()
+        ) else Select.NULL
 
     @work(thread=True, exclusive=True, group="server-info-bar")
     def _refresh_server_info(self) -> None:

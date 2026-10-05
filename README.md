@@ -24,14 +24,16 @@ buttons that open their respective managers as modals.
 3. For each match the container is probed for an RCON client (`rcon-cli`, `mcrcon`,
    `rcon`) and for RCON credentials.
 4. Credentials are auto-detected, in order:
+   - `rcon.password` / `rcon.port` in the container's `/data/server.properties` —
+     the authoritative values the running server actually authenticates with;
    - `rcon-cli` config inside the container (`/data/.rcon-cli.yaml`,
-     `/data/.rcon-cli.env`, or `$HOME/.rcon-cli.*`), which is how itzg images
-     provision RCON;
+     `/data/.rcon-cli.env`, or `$HOME/.rcon-cli.*`) — a fallback, since the copy a
+     server writes there can go stale and no longer match a live RCON password;
    - `RCON_PASSWORD` / `RCON_PORT` environment variables on the container.
 
 Nothing is required in advance: for an itzg server with RCON enabled, the app finds
-the container, locates `rcon-cli`, reads `.rcon-cli.yaml` and runs commands without
-you supplying a password.
+the container, locates `rcon-cli`, reads the password from `server.properties` and
+runs commands without you supplying it.
 
 Containers that do not ship an RCON client are still listed (for status/logs/restart)
 but RCON actions report that no client was found. When the scan finds a single running
@@ -339,5 +341,6 @@ Command shape adapts to the detected client: `mcrcon` uses `-H/-P/-p` flags inst
 Player status is collected with vanilla `data get entity` commands. The TUI refreshes
 the online-player list every 5 seconds and selected-player status every 10 seconds.
 
-Backups contain no restore UI by design; see the Backups section for a manual extract
-one-liner.
+Backups have no automated restore by design. The Backups modal's **Restore how-to**
+button prints the manual steps, and the Backups section above has an extract one-liner
+(`tar -xzf … -C <server-data-dir>`; stop the container first).
