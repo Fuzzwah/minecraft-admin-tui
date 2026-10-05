@@ -4,12 +4,14 @@ import argparse
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
+from rich.markup import escape
 from rich.text import Text
-from textual import on, work
+from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
@@ -21,6 +23,7 @@ from textual.widgets import (
     RichLog,
     Select,
     Static,
+    TextArea,
     TabbedContent,
     TabPane,
 )
@@ -29,11 +32,13 @@ from textual.widgets._tabbed_content import ContentTabs
 
 from mc_admin_core import (
     DEFAULT_LOCATIONS,
+    SETTINGS,
     DiscoveredServer,
     Kit,
     Location,
     PlayerSnapshot,
     ServerConfig,
+    ServerSettings,
     all_kits,
     available_runtimes,
     backup_world,
@@ -50,6 +55,7 @@ from mc_admin_core import (
     load_last_server,
     load_locations,
     load_server_configs,
+    load_server_settings,
     locations_path_for,
     migrate_legacy_locations,
     parse_kit_items,
@@ -60,9 +66,12 @@ from mc_admin_core import (
     rcon,
     restart_container,
     restore_procedure,
+    start_container,
+    stop_container,
     rule_name,
     save_custom_kits,
     save_locations,
+    save_server_settings,
     scan_servers,
     server_config_for,
     server_stats,
@@ -302,6 +311,402 @@ class BackupScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+class SettingsScreen(ModalScreen[tuple[str, ...]]):
+    """Edit the properties of the server captured when this modal opens."""
+
+    CSS = """
+    SettingsScreen {
+        align: center middle;
+    }
+    #settings-body {
+        width: 94%;
+        max-width: 100;
+        height: 92%;
+        padding: 0 1;
+        background: #161b22;
+        border: round #30363d;
+    }
+    #settings-title, #settings-target, #settings-status {
+        height: auto;
+    }
+    #settings-title {
+        color: #79c0ff;
+        text-style: bold;
+    }
+    #settings-status {
+        max-height: 3;
+        color: #f2cc60;
+    }
+    #settings-form {
+        height: 1fr;
+        margin-top: 1;
+    }
+    #settings-notice, #settings-missing, #settings-block {
+        height: auto;
+        margin-bottom: 1;
+    }
+    #settings-block {
+        color: #f2cc60;
+    }
+    .settings-field {
+        height: auto;
+        margin-bottom: 1;
+    }
+    .settings-field Label {
+        height: auto;
+        width: 1fr;
+    }
+    .settings-field .settings-help {
+        color: #8b949e;
+    }
+    #settings-motd {
+        height: 5;
+        min-height: 3;
+    }
+    #settings-buttons, #settings-confirmation {
+        height: auto;
+    }
+    #settings-buttons Button, #settings-confirmation Button {
+        min-width: 10;
+        width: 1fr;
+    }
+    #settings-confirmation {
+        display: none;
+    }
+    #settings-confirmation-label {
+        width: 2fr;
+        height: auto;
+        content-align: left middle;
+        color: #f2cc60;
+    }
+    """
+
+    BINDINGS = [Binding("escape", "close", "Close", priority=True)]
+
+    HELP = {
+        "motd": "Server-list message. Literal text; Unicode and line breaks are preserved.",
+        "max-players": "Maximum number of simultaneous players.",
+        "difficulty": "Controls hostile mob strength and survival difficulty.",
+        "gamemode": "Default game mode for players joining the world.",
+        "force-gamemode": "Apply the default game mode when players join.",
+        "pvp": "Allow players to damage other players.",
+        "white-list": "Only allow players on the whitelist to join.",
+        "enforce-whitelist": "Remove unlisted players when the whitelist is reloaded.",
+        "allow-flight": "Allow flight without kicking players for flying.",
+        "spawn-monsters": "Allow hostile mob spawning.",
+        "spawn-animals": "Allow animal spawning.",
+        "spawn-npcs": "Allow NPC spawning.",
+        "allow-nether": "Allow access to the Nether.",
+        "view-distance": "Server-side view distance, in chunks.",
+        "simulation-distance": "Distance for ticking entities, in chunks.",
+        "spawn-protection": "Spawn protection radius, in blocks; 0 disables it.",
+        "player-idle-timeout": "Idle kick timeout, in minutes; 0 disables it.",
+    }
+
+    def __init__(
+        self,
+        server: ServerConfig,
+        on_saved: Callable[[ServerConfig, tuple[str, ...]], None] | None = None,
+    ) -> None:
+        super().__init__()
+        self.server = server
+        self._on_saved = on_saved
+        self.snapshot: ServerSettings | None = None
+        self._loading = False
+        self._saving = False
+        self._settings_closed = False
+        self._updating = False
+        self._confirmation: str | None = None
+        self._saved_keys: set[str] = set()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="settings-body"):
+            yield Label("SERVER SETTINGS", id="settings-title")
+            yield Static(
+                f"{self.server.label} · {self.server.runtime}:{self.server.container}",
+                markup=False,
+                id="settings-target",
+            )
+            yield Static("Loading server.properties…", markup=False, id="settings-status")
+            with VerticalScroll(id="settings-form"):
+                yield Static(
+                    "Save does not restart the server. Apply changes from Server "
+                    "by typing RESTART, then choosing Restart container. Startup "
+                    "scripts must preserve server.properties edits.",
+                    markup=False,
+                    id="settings-notice",
+                )
+                yield Static("", markup=False, id="settings-block")
+                yield Static("", markup=False, id="settings-missing")
+                for setting in SETTINGS:
+                    with Vertical(id=f"settings-row-{setting.key}", classes="settings-field"):
+                        yield Label(f"{setting.label} ({setting.key})")
+                        help_text = self.HELP.get(setting.key, "")
+                        if setting.minimum is not None and setting.maximum is not None:
+                            help_text += f" Range: {setting.minimum}–{setting.maximum}."
+                        elif setting.minimum is not None:
+                            help_text += f" Minimum: {setting.minimum}."
+                        yield Label(help_text, classes="settings-help", markup=False)
+                        widget_id = f"settings-{setting.key}"
+                        if setting.kind == "text":
+                            yield TextArea("", soft_wrap=True, disabled=True, id=widget_id)
+                        elif setting.kind in {"bool", "choice"}:
+                            choices = ("true", "false") if setting.kind == "bool" else setting.choices
+                            yield Select(
+                                [(value, value) for value in choices],
+                                value=choices[0],
+                                allow_blank=False,
+                                disabled=True,
+                                id=widget_id,
+                            )
+                        else:
+                            yield Input(type="integer", disabled=True, id=widget_id)
+            with Horizontal(id="settings-confirmation"):
+                yield Static("", markup=False, id="settings-confirmation-label")
+                yield Button("Discard", id="settings-discard", variant="warning")
+                yield Button("Keep editing", id="settings-keep")
+            with Horizontal(id="settings-buttons"):
+                yield Button("Save", id="settings-save", variant="primary", disabled=True)
+                yield Button("Reload", id="settings-reload")
+                yield Button("Close", id="settings-close")
+
+    def on_mount(self) -> None:
+        for setting in SETTINGS:
+            self.query_one(f"#settings-row-{setting.key}").display = False
+        self._begin_load()
+
+    def on_unmount(self) -> None:
+        self._settings_closed = True
+
+    def _changes(self) -> dict[str, str]:
+        if self.snapshot is None:
+            return {}
+        changes: dict[str, str] = {}
+        for setting in SETTINGS:
+            if setting.key not in self.snapshot.values:
+                continue
+            widget = self.query_one(f"#settings-{setting.key}")
+            if isinstance(widget, TextArea):
+                value = widget.text
+            elif isinstance(widget, Input):
+                value = widget.value
+            else:
+                value = str(widget.value)
+            if value != self.snapshot.values[setting.key]:
+                changes[setting.key] = value
+        return changes
+
+    def _update_controls(self) -> None:
+        busy = self._loading or self._saving
+        confirming = self._confirmation is not None
+        for setting in SETTINGS:
+            available = self.snapshot is not None and setting.key in self.snapshot.values
+            self.query_one(f"#settings-{setting.key}").disabled = (
+                busy or confirming or not available
+            )
+        self.query_one("#settings-save", Button).disabled = (
+            busy or confirming or self.snapshot is None
+            or self.snapshot.write_blocked is not None or not self._changes()
+        )
+        self.query_one("#settings-reload", Button).disabled = busy or confirming
+        self.query_one("#settings-close", Button).disabled = self._saving or confirming
+
+    def _set_confirmation(self, operation: str | None) -> None:
+        self._confirmation = operation
+        self.query_one("#settings-confirmation").display = operation is not None
+        if operation is not None:
+            label = "Discard edits and close?" if operation == "close" else "Discard edits and reload?"
+            self.query_one("#settings-confirmation-label", Static).update(label)
+            self.query_one("#settings-keep", Button).focus()
+        self._update_controls()
+
+    def _begin_load(self) -> None:
+        if self._loading or self._saving:
+            return
+        self._loading = True
+        self.query_one("#settings-status", Static).update("Loading server.properties…")
+        self._update_controls()
+        self._load_worker(self.app)
+
+    @work(thread=True, exclusive=True, group="settings-load", exit_on_error=False)
+    def _load_worker(self, app: App) -> None:
+        try:
+            snapshot = load_server_settings(self.server)
+        except Exception as exc:
+            snapshot, error = None, str(exc)
+        else:
+            error = None
+        try:
+            app.call_from_thread(self._load_finished, snapshot, error)
+        except RuntimeError:
+            return  # application stopped while the read was in flight
+
+    def _load_finished(self, snapshot: ServerSettings | None, error: str | None) -> None:
+        if self._settings_closed or not self.is_mounted:
+            return
+        self._loading = False
+        if error is not None:
+            self.query_one("#settings-status", Static).update(
+                f"Read failed: {error}. Use Reload to retry."
+            )
+            self.query_one("#settings-block", Static).update(f"Read failed: {error}")
+            self.query_one("#settings-block").display = True
+            self._update_controls()
+            return
+        assert snapshot is not None
+        self._apply_snapshot(snapshot)
+        self.query_one("#settings-status", Static).update(
+            "Saving blocked by deployment configuration."
+            if snapshot.write_blocked else "Ready. Only changed settings will be saved."
+        )
+        self._update_controls()
+
+    def _apply_snapshot(self, snapshot: ServerSettings) -> None:
+        self._updating = True
+        self.snapshot = snapshot
+        missing: list[str] = []
+        for setting in SETTINGS:
+            present = setting.key in snapshot.values
+            self.query_one(f"#settings-row-{setting.key}").display = present
+            if not present:
+                missing.append(setting.key)
+                continue
+            value = snapshot.values[setting.key]
+            widget = self.query_one(f"#settings-{setting.key}")
+            if isinstance(widget, TextArea):
+                widget.load_text(value)
+            elif isinstance(widget, Input):
+                widget.value = value
+            else:
+                choices = ("true", "false") if setting.kind == "bool" else setting.choices
+                options = [(choice, choice) for choice in choices]
+                if value not in choices:
+                    options.append((Text(f"Current value: {value}"), value))
+                widget.set_options(options)
+                widget.value = value
+        self.query_one("#settings-target", Static).update(
+            f"{self.server.label} · {self.server.runtime}:{self.server.container}\n{snapshot.path}"
+        )
+        self.query_one("#settings-missing", Static).update(
+            "Not present in this server version/configuration (not editable): "
+            + ", ".join(missing) if missing else ""
+        )
+        self.query_one("#settings-missing").display = bool(missing)
+        self.query_one("#settings-block", Static).update(snapshot.write_blocked or "")
+        self.query_one("#settings-block").display = bool(snapshot.write_blocked)
+        self._updating = False
+
+    @on(Input.Changed)
+    @on(Select.Changed)
+    @on(TextArea.Changed)
+    def field_changed(self, event: Input.Changed | Select.Changed | TextArea.Changed) -> None:
+        event.stop()
+        if self._updating or self._settings_closed or self._loading or self._saving:
+            return
+        self._update_controls()
+
+    @on(Button.Pressed, "#settings-reload")
+    def reload_pressed(self) -> None:
+        if self._saving or self._loading or self._confirmation is not None:
+            return
+        if self._changes():
+            self._set_confirmation("reload")
+        else:
+            self._begin_load()
+
+    @on(Button.Pressed, "#settings-save")
+    def save_pressed(self) -> None:
+        if self._saving or self._loading or self._confirmation is not None:
+            return
+        if self.snapshot is None or self.snapshot.write_blocked:
+            return
+        changes = self._changes()
+        if not changes:
+            return
+        self._saving = True
+        self.query_one("#settings-status", Static).update("Saving… please wait; do not close.")
+        self._update_controls()
+        self._save_worker(self.app, self.snapshot, changes)
+
+    @work(thread=True, exclusive=True, group="settings-save", exit_on_error=False)
+    def _save_worker(
+        self, app: App, snapshot: ServerSettings, changes: dict[str, str]
+    ) -> None:
+        try:
+            updated = save_server_settings(self.server, snapshot, changes)
+        except Exception as exc:
+            updated, error = None, str(exc)
+        else:
+            error = None
+        try:
+            app.call_from_thread(self._save_finished, updated, tuple(changes), error)
+        except RuntimeError:
+            return  # application stopped while the write was in flight
+
+    def _save_finished(
+        self, snapshot: ServerSettings | None, keys: tuple[str, ...], error: str | None
+    ) -> None:
+        if self._settings_closed or not self.is_mounted:
+            return
+        self._saving = False
+        if error is not None:
+            self.query_one("#settings-status", Static).update(
+                f"Save failed: {error}. Edits retained; Reload discards them."
+            )
+            # Deployment configuration may have changed after the original read.
+            self.query_one("#settings-block", Static).update(error)
+            self.query_one("#settings-block").display = True
+            if self.snapshot is not None and "OVERRIDE_SERVER_PROPERTIES=false" in error:
+                self.snapshot = replace(self.snapshot, write_blocked=error)
+            self._update_controls()
+            return
+        assert snapshot is not None
+        self._apply_snapshot(snapshot)
+        self._saved_keys.update(keys)
+        self.query_one("#settings-status", Static).update(
+            "Saved. Restart required: close → Server → type RESTART → Restart container."
+        )
+        self.notify("Settings saved. Restart required; no restart performed.")
+        self._update_controls()
+        if self._on_saved is not None:
+            self._on_saved(self.server, keys)
+
+    @on(Button.Pressed, "#settings-close")
+    def close_pressed(self) -> None:
+        self.action_close()
+
+    def action_close(self) -> None:
+        if self._saving:
+            return
+        if self._confirmation is not None:
+            self._set_confirmation(None)
+        elif self._changes():
+            self._set_confirmation("close")
+        else:
+            self._close()
+
+    def _close(self) -> None:
+        self._settings_closed = True
+        self.dismiss(tuple(setting.key for setting in SETTINGS if setting.key in self._saved_keys))
+
+    @on(Button.Pressed, "#settings-keep")
+    def keep_pressed(self) -> None:
+        self._set_confirmation(None)
+
+    @on(Button.Pressed, "#settings-discard")
+    def discard_pressed(self) -> None:
+        if self._saving:
+            return
+        operation = self._confirmation
+        self._set_confirmation(None)
+        if operation == "close":
+            self._close()
+        elif operation == "reload":
+            if self.snapshot is not None:
+                self._apply_snapshot(self.snapshot)
+            self._begin_load()
+
+
 class MinecraftAdminApp(App[None]):
     TITLE = "Minecraft Admin"
     SUB_TITLE = "Server cockpit"
@@ -361,7 +766,7 @@ class MinecraftAdminApp(App[None]):
         color: #e6edf3;
     }
 
-    #open-backups {
+    #open-backups, #open-settings {
         width: 14;
         min-height: 3;
     }
@@ -470,7 +875,7 @@ class MinecraftAdminApp(App[None]):
         padding-top: 1;
     }
 
-    #give-row, #coords-row, #location-row, #raw-row, #restart-row,
+    #give-row, #coords-row, #location-row, #raw-row, #restart-row, #stop-row,
     #backup-row, #backup-list-row, #kit-row, #kit-save-row {
         height: auto;
         margin-top: 1;
@@ -509,7 +914,7 @@ class MinecraftAdminApp(App[None]):
         margin-right: 1;
     }
 
-    #restart-confirm {
+    #restart-confirm, #stop-confirm {
         width: 1fr;
         margin-right: 1;
     }
@@ -555,8 +960,8 @@ class MinecraftAdminApp(App[None]):
     }
 
     #server-log {
-        height: 1fr;
-        min-height: 10;
+        height: 8;
+        min-height: 3;
         border: round #30363d;
         margin-top: 1;
     }
@@ -571,6 +976,19 @@ class MinecraftAdminApp(App[None]):
         margin-top: 1;
     }
 
+    Screen.compact #server-bar, Screen.compact #context-bar {
+        height: 3;
+        margin-bottom: 0;
+    }
+    Screen.compact #server-info-bar {
+        margin-bottom: 0;
+    }
+    Screen.compact #server-info {
+        min-height: 1;
+        max-height: 3;
+        padding: 0;
+    }
+
     Button.-primary {
         background: #238636;
     }
@@ -579,21 +997,24 @@ class MinecraftAdminApp(App[None]):
     BINDINGS = [
         ("ctrl+r", "refresh_players", "Refresh players"),
         Binding("alt+r", "scan_servers", "Rescan servers", priority=True),
-        # Tab jumps: single letter, plus Ctrl+letter and Alt+letter (Option on mac).
-        # priority=True lets them beat widget bindings while focus is outside a
-        # text field; inside an Input/TextArea the letter must reach the field.
-        Binding("g,ctrl+g,alt+g", "show_tab('give-tab')", "Give", priority=True),
-        Binding("k,ctrl+k,alt+k", "show_tab('kits-tab')", "Kits", priority=True),
-        Binding(
-            "t,ctrl+t,alt+t", "show_tab('teleport-tab')", "Teleport", priority=True
-        ),
-        Binding("w,ctrl+w,alt+w", "show_tab('world-tab')", "World", priority=True),
-        Binding("s,ctrl+s,alt+s", "show_tab('server-tab')", "Server", priority=True),
-        Binding("b,ctrl+b,alt+b", "open_backups", "Backups", priority=True),
-        Binding(
-            "a,ctrl+a,alt+a", "show_tab('activity-tab')", "Activity", priority=True
-        ),
-        Binding("f,ctrl+f,alt+f", "show_tab('fun-tab')", "Fun", priority=True),
+        # Plain letters reach editors; modified keys can jump from text fields.
+        Binding("g", "show_tab('give-tab')", "Give"),
+        Binding("ctrl+g,alt+g", "show_tab('give-tab')", "Give", priority=True, show=False),
+        Binding("k", "show_tab('kits-tab')", "Kits"),
+        Binding("ctrl+k,alt+k", "show_tab('kits-tab')", "Kits", priority=True, show=False),
+        Binding("t", "show_tab('teleport-tab')", "Teleport"),
+        Binding("ctrl+t,alt+t", "show_tab('teleport-tab')", "Teleport", priority=True, show=False),
+        Binding("w", "show_tab('world-tab')", "World"),
+        Binding("ctrl+w,alt+w", "show_tab('world-tab')", "World", priority=True, show=False),
+        Binding("s", "show_tab('server-tab')", "Server"),
+        Binding("ctrl+s,alt+s", "show_tab('server-tab')", "Server", priority=True, show=False),
+        Binding("b", "open_backups", "Backups"),
+        Binding("ctrl+b,alt+b", "open_backups", "Backups", priority=True, show=False),
+        Binding("ctrl+o", "open_settings", "Settings"),
+        Binding("a", "show_tab('activity-tab')", "Activity"),
+        Binding("ctrl+a,alt+a", "show_tab('activity-tab')", "Activity", priority=True, show=False),
+        Binding("f", "show_tab('fun-tab')", "Fun"),
+        Binding("ctrl+f,alt+f", "show_tab('fun-tab')", "Fun", priority=True, show=False),
         ("q", "quit", "Quit"),
     ]
 
@@ -615,6 +1036,14 @@ class MinecraftAdminApp(App[None]):
         self.locations: dict[str, Location] = {}
         self.kits: dict[str, Kit] = all_kits()
         self.inventory: list[tuple[int, int, str]] = []
+        self._lifecycle_busy = False
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        # App priority bindings are considered before modal widget bindings.
+        # Suppress the entire app namespace so editors and Selects keep their keys.
+        if isinstance(self.screen, ModalScreen):
+            return False
+        return super().check_action(action, parameters)
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -631,6 +1060,7 @@ class MinecraftAdminApp(App[None]):
             with Horizontal(id="server-info-bar"):
                 yield Static("No server selected.", id="server-info")
                 yield Button("Backups", id="open-backups")
+                yield Button("Settings", id="open-settings")
             with Horizontal(id="context-bar"):
                 yield Label("TARGET: none", id="target-label")
                 yield Select(
@@ -780,27 +1210,39 @@ class MinecraftAdminApp(App[None]):
                         yield Button("Hard", id="diff-hard")
 
                 with TabPane("Server", id="server-tab"):
-                    yield Static("Server status not loaded.", id="server-status")
-                    with Horizontal(classes="button-row"):
-                        yield Button("Refresh status", id="server-refresh")
-                        yield Button("Save all", id="server-save")
-                        yield Button("Tail logs", id="server-tail")
-                    yield Label("RAW RCON", classes="section-title")
-                    with Horizontal(id="raw-row"):
-                        yield Input(
-                            placeholder="e.g. say Dinner in 5 minutes",
-                            id="raw-command",
+                    with VerticalScroll(id="server-controls"):
+                        yield Static("Server status not loaded.", id="server-status")
+                        with Horizontal(classes="button-row"):
+                            yield Button("Refresh status", id="server-refresh")
+                            yield Button("Save all", id="server-save")
+                            yield Button("Tail logs", id="server-tail")
+                        yield Label("RAW RCON", classes="section-title")
+                        with Horizontal(id="raw-row"):
+                            yield Input(
+                                placeholder="e.g. say Dinner in 5 minutes",
+                                id="raw-command",
+                            )
+                            yield Button("Send", id="raw-send")
+                        yield RichLog(id="server-log", markup=False, wrap=True)
+                        yield Label(
+                            "Start/Restart check deployment property overrides first; "
+                            "they do not recreate containers or change deployment options. "
+                            "Minecraft may still be loading after the container starts.",
+                            classes="help",
                         )
-                        yield Button("Send", id="raw-send")
-                    yield RichLog(id="server-log", markup=False, wrap=True)
-                    yield Label(
-                        "Restart requires typing RESTART. This restarts the "
-                        "container on its runtime.",
-                        id="danger-note",
-                    )
-                    with Horizontal(id="restart-row"):
-                        yield Input(placeholder="Type RESTART", id="restart-confirm")
-                        yield Button("Restart container", id="server-restart")
+                        with Horizontal(classes="button-row"):
+                            yield Button("Start container", id="server-start")
+                        yield Label(
+                            "Stop requires STOP. Restart requires RESTART. "
+                            "Both interrupt connected players.",
+                            id="danger-note",
+                        )
+                        with Horizontal(id="stop-row"):
+                            yield Input(placeholder="Type STOP", id="stop-confirm")
+                            yield Button("Stop container", id="server-stop")
+                        with Horizontal(id="restart-row"):
+                            yield Input(placeholder="Type RESTART", id="restart-confirm")
+                            yield Button("Restart container", id="server-restart")
 
                 with TabPane("Activity", id="activity-tab"):
                     yield RichLog(id="activity-log", markup=True, wrap=True)
@@ -838,6 +1280,9 @@ class MinecraftAdminApp(App[None]):
         self.set_interval(5, self.refresh_players)
         self.set_interval(10, self.refresh_selected_player)
 
+    def on_resize(self, event: events.Resize) -> None:
+        self.default_screen.set_class(event.size.height < 32, "compact")
+
     def _activate_server(self, config: ServerConfig) -> None:
         self.config = config
         if config.locations_path:
@@ -854,17 +1299,22 @@ class MinecraftAdminApp(App[None]):
 
     @work(thread=True, exclusive=True, group="server-info-bar")
     def _refresh_server_info(self) -> None:
-        if self.config is None:
+        server = self.config
+        if server is None:
             return
         try:
-            level = container_level_name(self.config)
-            stats = server_stats(self.config, level)
+            level = container_level_name(server)
+            stats = server_stats(server, level)
         except Exception as exc:
-            self.call_from_thread(self._apply_server_info, None, str(exc))
+            self.call_from_thread(self._apply_server_info, server, None, str(exc))
             return
-        self.call_from_thread(self._apply_server_info, stats, None)
+        self.call_from_thread(self._apply_server_info, server, stats, None)
 
-    def _apply_server_info(self, stats: dict | None, error: str | None) -> None:
+    def _apply_server_info(
+        self, server: ServerConfig, stats: dict | None, error: str | None
+    ) -> None:
+        if not self._is_selected_server(server):
+            return
         try:
             widget = self.query_one("#server-info", Static)
         except Exception:
@@ -891,14 +1341,14 @@ class MinecraftAdminApp(App[None]):
             players_text = "—"
         size = human_size(stats.get("world_size"))
         lines = [
-            f"[b]{self.config.label}[/b]  ·  {self.config.runtime}",
-            f"[dim]{stats.get('image', '')}[/]",
+            f"[b]{escape(self.config.label)}[/b]  ·  {escape(self.config.runtime)}",
+            f"[dim]{escape(str(stats.get('image', '')))}[/]",
             f"MC {version}   ·   {state}"
             + (f"   ·   uptime {uptime}" if uptime else ""),
             f"Players {players_text}   ·   World {size}",
         ]
         if stats.get("motd"):
-            lines.append(f"[dim]motd: {stats['motd']}[/]")
+            lines.append(f"[dim]motd: {escape(str(stats['motd']))}[/]")
         widget.update("\n".join(lines))
 
     def _server_options(self) -> list[tuple[Text, str]]:
@@ -971,7 +1421,8 @@ class MinecraftAdminApp(App[None]):
             )
             self._activate_server(server_config_for(first))
         elif self.config is not None:
-            select.value = f"{self.config.runtime}:{self.config.container}"
+            selected = f"{self.config.runtime}:{self.config.container}"
+            select.value = selected if any(value == selected for _, value in options) else Select.NULL
 
     @on(Select.Changed, "#server-select")
     def server_selected(self, event: Select.Changed) -> None:
@@ -1128,6 +1579,35 @@ class MinecraftAdminApp(App[None]):
     @on(Button.Pressed, "#open-backups")
     def open_backups_pressed(self) -> None:
         self.action_open_backups()
+
+    def action_open_settings(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
+        if self.config is None:
+            self.notify("Select a server first", severity="warning")
+            return
+        if self._lifecycle_busy:
+            self.notify("Wait for the container operation to finish", severity="warning")
+            return
+        self.push_screen(SettingsScreen(self.config, self._settings_saved))
+
+    @on(Button.Pressed, "#open-settings")
+    def open_settings_pressed(self) -> None:
+        self.action_open_settings()
+
+    def _is_selected_server(self, server: ServerConfig) -> bool:
+        return self.config is not None and (
+            self.config.runtime, self.config.container, self.config.working_dir
+        ) == (server.runtime, server.container, server.working_dir)
+
+    def _settings_saved(self, server: ServerConfig, keys: tuple[str, ...]) -> None:
+        target = escape(f"{server.runtime}:{server.container}")
+        self._log(
+            f"[green]Settings saved[/] for {target}: {', '.join(keys)}. "
+            "[yellow]Restart required; no restart performed.[/]"
+        )
+        if self._is_selected_server(server):
+            self._refresh_server_info()
 
     @work(thread=True, exclusive=True, group="snapshot")
     def refresh_selected_player(self) -> None:
@@ -1744,34 +2224,106 @@ class MinecraftAdminApp(App[None]):
         field.value = ""
         self.run_rcon_action(f"RCON: {command}", command, False)
 
+    @on(Button.Pressed, "#server-start")
+    def server_start(self) -> None:
+        self._begin_lifecycle("start")
+
+    @on(Button.Pressed, "#server-stop")
+    def server_stop(self) -> None:
+        if self._lifecycle_busy:
+            return
+        confirm = self.query_one("#stop-confirm", Input)
+        if confirm.value.strip() != "STOP":
+            self.notify("Type STOP first", severity="warning")
+            return
+        if self._begin_lifecycle("stop"):
+            confirm.value = ""
+
     @on(Button.Pressed, "#server-restart")
     def server_restart(self) -> None:
+        if self._lifecycle_busy:
+            return
         confirm = self.query_one("#restart-confirm", Input)
         if confirm.value.strip() != "RESTART":
             self.notify("Type RESTART first", severity="warning")
             return
-        confirm.value = ""
-        self.restart_server_container()
+        if self._begin_lifecycle("restart"):
+            confirm.value = ""
 
-    @work(thread=True, exclusive=True, group="restart")
-    def restart_server_container(self) -> None:
-        if self.config is None:
-            return
+    def _set_lifecycle_busy(self, busy: bool) -> None:
+        self._lifecycle_busy = busy
+        for widget_id in (
+            "server-start", "server-stop", "server-restart",
+            "stop-confirm", "restart-confirm", "open-settings",
+        ):
+            self.query_one(f"#{widget_id}").disabled = busy
+
+    def _begin_lifecycle(self, operation: str) -> bool:
+        if self._lifecycle_busy or isinstance(self.screen, ModalScreen):
+            return False
+        server = self.config
+        if server is None:
+            self.notify("Select a server first", severity="warning")
+            return False
+        self._set_lifecycle_busy(True)
+        self.query_one("#server-status", Static).update(
+            Text(f"{server.label}: container {operation} in progress…")
+        )
+        self._lifecycle_worker(server, operation)
+        return True
+
+    @work(thread=True, group="container-lifecycle", exit_on_error=False)
+    def _lifecycle_worker(self, server: ServerConfig, operation: str) -> None:
+        operations = {
+            "start": start_container,
+            "stop": stop_container,
+            "restart": restart_container,
+        }
         try:
-            output = restart_container(self.config)
-            self.call_from_thread(self._restart_finished, output, None)
+            output = operations[operation](server)
         except Exception as exc:
-            self.call_from_thread(self._restart_finished, "", str(exc))
-
-    def _restart_finished(self, output: str, error: str | None) -> None:
-        if error:
-            self._log(f"[red]Container restart failed:[/] {error}")
-            self.notify("Restart failed", severity="error")
+            output, error = "", str(exc)
+        else:
+            error = None
+        try:
+            self.call_from_thread(self._lifecycle_finished, server, operation, output, error)
+        except RuntimeError:
             return
-        self._log(f"[yellow]Container restarted[/] {output}")
-        self.notify("Minecraft container restarted")
-        self.set_timer(2, self.refresh_server_status)
-        self.set_timer(4, self.refresh_players)
+
+    def _lifecycle_finished(
+        self, server: ServerConfig, operation: str, output: str, error: str | None
+    ) -> None:
+        self._set_lifecycle_busy(False)
+        target = f"{server.runtime}:{server.container}"
+        if error:
+            self._log(f"[red]Container {operation} failed[/] for {escape(target)}: {escape(error)}")
+            self.notify(f"Container {operation} failed: {error}", severity="error", timeout=12)
+            if self._is_selected_server(server):
+                self.query_one("#server-status", Static).update(
+                    Text(f"{target}: {operation} failed\n{error}")
+                )
+            return
+        suffix = (
+            "Container stopped."
+            if operation == "stop" else "Container running; Minecraft may still be loading."
+        )
+        self._log(
+            f"[yellow]Container {operation} completed[/] for {escape(target)}. {suffix}"
+        )
+        self.notify(f"{target}: {suffix}")
+        self.scan_servers()
+        if self._is_selected_server(server):
+            self.refresh_server_status()
+            self._refresh_server_info()
+            self.refresh_players()
+            if operation != "stop":
+                self.set_timer(4, lambda: self._refresh_after_lifecycle(server))
+
+    def _refresh_after_lifecycle(self, server: ServerConfig) -> None:
+        if self._is_selected_server(server):
+            self.refresh_server_status()
+            self._refresh_server_info()
+            self.refresh_players()
 
     @on(Button.Pressed, "#fun-totem")
     def fun_totem(self) -> None:

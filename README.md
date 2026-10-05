@@ -11,8 +11,8 @@ operate on those same targets.
 ![Minecraft Admin TUI — server info banner, Player tab with inventory](docs/demo.png)
 
 The top section shows, for the selected server: runtime, image, Minecraft version,
-state, uptime, online players and world size — with a **Backups** button that opens the
-world-backup manager as a modal.
+state, uptime, online players and world size — with **Settings** and **Backups**
+buttons that open their respective managers as modals.
 
 ![Minecraft Admin TUI — Give tab with fuzzy item search](docs/demo-give.png)
 
@@ -49,14 +49,75 @@ greyed in the list).
   server's `mcxbox.properties`, or from the version comment in `server.properties`
 - world size uses `du -sb` when the server is running, else the archive stream
 - **Backups** button (same line) opens the backup manager modal
+- **Settings** button opens the server properties editor
 
 ### Server
 
 - host scan across Podman and Docker
 - server picker (runtime + container + state), running servers first, stopped greyed
 - manual registration (`Add`) for containers the scan cannot match
-- container status, Save all, tail logs, raw RCON, restart (requires typing `RESTART`)
+- container status, Save all, tail logs, raw RCON
+- **Start container**, **Stop container** (type `STOP`) and restart (type `RESTART`)
+- Stop/Restart allow at least 60 seconds for graceful shutdown, or the container's
+  configured stop timeout if longer
+- Start/Restart reuse the existing container; they cannot change its environment,
+  image, ports or volumes. The status distinguishes a running container from a
+  Minecraft server that may still be loading
 - the last used server is remembered and pre-selected next launch
+
+### Server settings
+
+Open **Settings** in the banner or press `Ctrl+O`. The editor reads the selected
+server's `server.properties` from its working/data directory and offers:
+
+- multiline **MOTD**, including Unicode and Minecraft `§` formatting codes
+- maximum players, difficulty, default game mode and force game mode
+- PvP, whitelist and enforcement, flight, mob spawning and Nether access
+- view/simulation distance, spawn protection and idle kick timeout
+
+Only properties already present in the file are editable; missing/version-specific
+properties are listed, not added with guessed defaults. Numeric ranges and boolean/
+choice values are validated before any write. Unknown properties, credentials,
+comments, file permissions and numeric ownership are preserved.
+
+**Save does not apply these changes live or restart the server.** Close the modal,
+then use Server → type `RESTART` → Restart container, or Start if it is stopped.
+World's existing difficulty/time/weather/gamerule buttons remain live RCON actions.
+Reload and Close/Escape ask before discarding unsaved edits; failed saves retain them.
+
+#### Container startup configuration
+
+The [itzg image normally manages `server.properties` at startup](https://docker-minecraft-server.readthedocs.io/en/latest/configuration/server-properties/).
+For persistent TUI-managed settings, add this to the deployment:
+
+```yaml
+environment:
+  OVERRIDE_SERVER_PROPERTIES: "false"
+```
+
+Recreate the container through its deployment tool, **retaining the existing data
+volume**, to apply an environment change. A simple container restart is insufficient.
+`SKIP_SERVER_PROPERTIES=true` is also accepted when you manage creation of the file
+yourself. With manual property management enabled, later property-related environment
+changes no longer update the existing file; edit the file/TUI instead.
+
+The TUI blocks Settings saves and Start/Restart for itzg containers without either
+flag, and explains the required deployment change. Stop remains available. Generic
+images are not gated, but their startup scripts must likewise preserve file edits.
+The TUI never recreates containers. Auto-remove containers and services such as
+Quadlet must be recreated/started by their deployment owner, then rediscovered with
+Scan; container Start cannot recreate a removed container.
+
+Settings use container copy streams, including for stopped servers. Podman ownership
+preservation also requires `stat`; stopped Podman editing requires a persistent data
+mount on this host and the default user namespace. Start a container with a custom
+user namespace before editing it. If ownership cannot be determined safely, no
+settings are written.
+
+An external edit detected before writing is rejected; Reload to get the new file.
+Container copy is not an atomic compare-and-swap: avoid simultaneous external
+writers. After a failed/timed-out copy, Reload to inspect the actual file before
+retrying, since the copy may have partially completed.
 
 ### Player
 
@@ -204,12 +265,14 @@ Full option list: `mc-admin-tui --help`.
   `Option+<key>`). A jump focuses the tab bar, so one `Tab` then moves into the first
   field of that tab (e.g. `g`, `Tab` → the item search box)
 - `b` / `Ctrl+B` / `⌥B` — open the Backups modal (`Esc` closes)
+- `Ctrl+O` — open Settings; `Esc` closes, with confirmation for unsaved edits
 - `Alt+R` — rescan the host for servers
 - `Ctrl+R` — refresh online players
 - `q` — quit when the focused widget isn't consuming the key
 
 While a text field has focus its letters go to the field; use the `Alt`/`Option`
-(and `Ctrl`) variants to switch tabs from there.
+(and `Ctrl`) variants to switch tabs from there. While a modal is open, application
+hotkeys are suspended so its editors and selectors keep their keys.
 
 ## Config and state files
 
