@@ -385,9 +385,14 @@ def rcon_client_in_container(runtime: str, container: str) -> str | None:
 def _rcon_settings_from_container(
     runtime: str, container: str
 ) -> tuple[str | None, int | None, str | None]:
+    # server.properties is the authoritative source (it is what the running server
+    # actually uses); the .rcon-cli.yaml/.env a server writes can go stale, so they
+    # are only a fallback.
     command = (
+        "rc=/data/server.properties; [ -f \"$rc\" ] && "
+        "{ echo '###auth'; grep -E '^rcon\\.(password|port)=' \"$rc\"; }; "
         "for f in /data/.rcon-cli.yaml /data/.rcon-cli.env "
-        '$HOME/.rcon-cli.yaml $HOME/.rcon-cli.env; do '
+        "$HOME/.rcon-cli.yaml $HOME/.rcon-cli.env; do "
         '[ -f "$f" ] && { echo "###$f"; cat "$f"; }; done; exit 0'
     )
     try:
@@ -401,19 +406,21 @@ def _rcon_settings_from_container(
     password: str | None = None
     port: int | None = None
     working_dir: str | None = None
+    section = ""
     for line in raw.splitlines():
         if line.startswith("###"):
-            if password is not None and working_dir is None:
-                working_dir = str(Path(line[3:].strip()).parent)
+            section = line[3:].strip()
+            if section != "auth" and password is not None and working_dir is None:
+                working_dir = str(Path(section).parent)
             continue
         key, _, value = line.partition("=")
-        if not value and ":" in line:
+        if not value and ":" in line and section != "auth":
             key, _, value = line.partition(":")
         key = key.strip().lower()
         value = value.strip().strip('"').strip("'")
-        if key == "password" and value and password is None:
+        if key in ("rcon.password", "password") and value and password is None:
             password = value
-        elif key == "port" and value.isdigit() and port is None:
+        elif key in ("rcon.port", "port") and value.isdigit() and port is None:
             port = int(value)
     return password, port, working_dir
 

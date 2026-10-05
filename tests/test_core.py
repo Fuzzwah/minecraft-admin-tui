@@ -1071,5 +1071,36 @@ class ServerSettingsTests(unittest.TestCase):
         self.assertEqual(_properties_from_tar(_settings_tar(b"", tarfile.SYMTYPE)), {})
 
 
+class RconAuthTests(unittest.TestCase):
+    def test_server_properties_password_wins_over_stale_client_config(self):
+        """A stale .rcon-cli.yaml must not shadow the real password."""
+        from mc_admin_core import _rcon_settings_from_container
+
+        output = (
+            "###auth\n"
+            "rcon.password=AUTHENTIC\n"
+            "rcon.port=25575\n"
+            "###/data/.rcon-cli.yaml\n"
+            'password: "STALE"\n'
+        )
+        with patch("mc_admin_core.shutil.which", return_value="/usr/bin/podman"), patch(
+            "mc_admin_core.run_process", return_value=output
+        ):
+            password, port, working_dir = _rcon_settings_from_container("podman", "mc")
+        self.assertEqual(password, "AUTHENTIC")
+        self.assertEqual(port, 25575)
+        self.assertEqual(working_dir, "/data")
+
+    def test_falls_back_to_client_config_without_properties(self):
+        from mc_admin_core import _rcon_settings_from_container
+
+        output = "###/data/.rcon-cli.yaml\npassword: \"YAML\"\n"
+        with patch("mc_admin_core.shutil.which", return_value="/usr/bin/podman"), patch(
+            "mc_admin_core.run_process", return_value=output
+        ):
+            password, _port, _working_dir = _rcon_settings_from_container("podman", "mc")
+        self.assertEqual(password, "YAML")
+
+
 if __name__ == "__main__":
     unittest.main()
