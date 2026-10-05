@@ -668,6 +668,38 @@ class ContainerLifecycleTests(unittest.TestCase):
                 self.assertNotIn("DO_NOT_LEAK", str(error.exception))
             run.assert_not_called()
 
+    def _stop_argv(self, info, runtime="podman"):
+        server = ServerConfig(runtime, "mc_one")
+        with patch("mc_admin_core.inspect_container", return_value=info), patch(
+            "mc_admin_core.shutil.which", return_value="/usr/bin/runtime"
+        ), patch("mc_admin_core.run_process", return_value="") as run:
+            stop_container(server)
+        return run.call_args.args[0]
+
+    def test_stop_uses_configured_stop_timeout(self):
+        argv = self._stop_argv({"Config": {"StopTimeout": 120}})
+        self.assertEqual(argv, ["podman", "stop", "--time", "120", "mc_one"])
+
+    def test_stop_grace_period_defaults_and_clamps_to_60(self):
+        # no StopTimeout configured
+        self.assertEqual(
+            self._stop_argv({"Config": {}}),
+            ["podman", "stop", "--time", "60", "mc_one"],
+        )
+        # a too-small configured value is raised to the 60s floor
+        self.assertEqual(
+            self._stop_argv({"Config": {"StopTimeout": 5}}),
+            ["podman", "stop", "--time", "60", "mc_one"],
+        )
+
+    def test_stop_is_allowed_on_managed_image(self):
+        # stop must never be blocked by the server.properties override guard
+        info = {
+            "Config": {"Image": "itzg/minecraft-server:latest", "Env": ["RCON_PASSWORD=DO_NOT_LEAK"]}
+        }
+        argv = self._stop_argv(info, runtime="docker")
+        self.assertEqual(argv, ["docker", "stop", "--time", "60", "mc_one"])
+
 
 def _settings_tar(raw: bytes, kind=tarfile.REGTYPE, mode=0o640, owner=(1001, 1002)) -> bytes:
     buffer = io.BytesIO()
