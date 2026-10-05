@@ -194,6 +194,45 @@ class ServerConfig:
         return self.display_name or self.container
 
 
+
+@dataclass(frozen=True)
+class ServerSetting:
+    key: str
+    label: str
+    kind: str
+    choices: tuple[str, ...] = ()
+    minimum: int | None = None
+    maximum: int | None = None
+
+
+SETTINGS: tuple[ServerSetting, ...] = (
+    ServerSetting("motd", "MOTD", "text"),
+    ServerSetting("max-players", "Maximum players", "int", minimum=1, maximum=2147483647),
+    ServerSetting("difficulty", "Difficulty", "choice", ("peaceful", "easy", "normal", "hard")),
+    ServerSetting("gamemode", "Game mode", "choice", ("survival", "creative", "adventure", "spectator")),
+    ServerSetting("force-gamemode", "Force game mode", "bool"),
+    ServerSetting("pvp", "PvP", "bool"),
+    ServerSetting("white-list", "Whitelist", "bool"),
+    ServerSetting("enforce-whitelist", "Enforce whitelist", "bool"),
+    ServerSetting("allow-flight", "Allow flight", "bool"),
+    ServerSetting("spawn-monsters", "Spawn monsters", "bool"),
+    ServerSetting("spawn-animals", "Spawn animals", "bool"),
+    ServerSetting("spawn-npcs", "Spawn NPCs", "bool"),
+    ServerSetting("allow-nether", "Allow Nether", "bool"),
+    ServerSetting("view-distance", "View distance", "int", minimum=2, maximum=32),
+    ServerSetting("simulation-distance", "Simulation distance", "int", minimum=2, maximum=32),
+    ServerSetting("spawn-protection", "Spawn protection", "int", minimum=0, maximum=2147483647),
+    ServerSetting("player-idle-timeout", "Player idle timeout", "int", minimum=0, maximum=2147483647),
+)
+
+
+@dataclass(frozen=True)
+class ServerSettings:
+    path: str
+    raw: bytes
+    values: dict[str, str]
+    write_blocked: str | None = None
+
 @dataclass(frozen=True)
 class DiscoveredServer:
     runtime: str
@@ -493,8 +532,30 @@ def tail_logs(server: ServerConfig, lines: int = 100) -> str:
     return container_command(server, "logs", "--tail", str(lines), timeout=15)
 
 
+def start_container(server: ServerConfig) -> str:
+    _, blocked = _settings_context(server)
+    if blocked:
+        raise RuntimeError(blocked)
+    return container_command(server, "start", timeout=90)
+
+
+def _stop_timeout(server: ServerConfig) -> int:
+    info = inspect_container(server.runtime, server.container)
+    configured = (info.get("Config") or {}).get("StopTimeout")
+    return max(60, int(configured or 0))
+
+
+def stop_container(server: ServerConfig) -> str:
+    grace = _stop_timeout(server)
+    return container_command(server, "stop", "--time", str(grace), timeout=grace + 30)
+
+
 def restart_container(server: ServerConfig) -> str:
-    return container_command(server, "restart", timeout=90)
+    _, blocked = _settings_context(server)
+    if blocked:
+        raise RuntimeError(blocked)
+    grace = _stop_timeout(server)
+    return container_command(server, "restart", "--time", str(grace), timeout=grace + 30)
 
 
 def server_stats(server: ServerConfig, level_name: str = "world") -> dict:
@@ -1104,27 +1165,330 @@ def rule_name(server: ServerConfig, canonical: str) -> str:
     return canonical
 
 
-def _properties_from_tar(buf: bytes, member_name: str = "server.properties") -> dict:
-    """Parse a .properties file out of a tar stream into a dict (plus '_raw')."""
+@dataclass(frozen=True)
+class _PropertyRecord:
+    key: str
+    start: int
+    end: int
+    newline: bytes
+
+
+def _properties_text(raw: bytes) -> str:
+    # Modern Minecraft uses UTF-8; older Java properties may contain Latin-1.
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("latin-1")
+
+
+def _unescape_property(text: str) -> str:
+    result: list[str] = []
+    index = 0
+    escapes = {"t": "\t", "n": "\n", "r": "\r", "f": "\f"}
+    while index < len(text):
+        char = text[index]
+        index += 1
+        if char != "\\":
+            result.append(char)
+            continue
+        if index == len(text):
+            raise ValueError("unfinished escape")
+        char = text[index]
+        index += 1
+        if char == "u":
+            digits = text[index:index + 4]
+            if len(digits) != 4 or not re.fullmatch(r"[0-9a-fA-F]{4}", digits):
+                raise ValueError("invalid Unicode escape")
+            result.append(chr(int(digits, 16)))
+            index += 4
+        else:
+            # Java also accepts unknown escapes, dropping the backslash.
+            result.append(escapes.get(char, char))
+    value = "".join(result)
+    if any(0xD800 <= ord(char) <= 0xDFFF for char in value):
+        try:
+            value = value.encode("utf-16-le", "surrogatepass").decode("utf-16-le")
+        except UnicodeDecodeError:
+            raise ValueError("unpaired Unicode surrogate") from None
+    if "\0" in value:
+        raise ValueError("NUL character")
+    return value
+
+
+def _parse_properties(raw: bytes) -> tuple[dict[str, str], list[_PropertyRecord]]:
+    """Parse Java properties, retaining byte ranges for lossless targeted edits."""
+    # splitlines() also splits form feed, which Java treats as key whitespace.
+    lines = re.findall(rb"[^\r\n]*(?:\r\n|\r|\n|$)", raw)
+    if lines and not lines[-1]:
+        lines.pop()
+    encoding = "utf-8"
+    try:
+        raw.decode(encoding)
+    except UnicodeDecodeError:
+        encoding = "latin-1"
+    values: dict[str, str] = {}
+    records: list[_PropertyRecord] = []
+    offset = 0
+    index = 0
+    while index < len(lines):
+        start = offset
+        line_number = index + 1
+        physical = lines[index]
+        offset += len(physical)
+        index += 1
+        text = physical.rstrip(b"\r\n").decode(encoding)
+        logical = text.lstrip(" \t\f")
+        if not logical or logical.startswith(("#", "!")):
+            continue
+        try:
+            while (len(logical) - len(logical.rstrip("\\"))) % 2:
+                if index == len(lines):
+                    raise ValueError("unfinished continuation")
+                physical = lines[index]
+                offset += len(physical)
+                index += 1
+                logical = logical[:-1] + physical.rstrip(b"\r\n").decode(encoding).lstrip(" \t\f")
+            key_end = 0
+            while key_end < len(logical):
+                char = logical[key_end]
+                if char in "=:\t \f":
+                    break
+                key_end += 2 if char == "\\" else 1
+            value_start = key_end
+            if value_start < len(logical):
+                if logical[value_start] in " \t\f":
+                    while value_start < len(logical) and logical[value_start] in " \t\f":
+                        value_start += 1
+                if value_start < len(logical) and logical[value_start] in "=:":
+                    value_start += 1
+                while value_start < len(logical) and logical[value_start] in " \t\f":
+                    value_start += 1
+            key = _unescape_property(logical[:key_end])
+            value = _unescape_property(logical[value_start:])
+        except ValueError as exc:
+            # Never include file contents: unknown properties can be credentials.
+            raise ValueError(
+                f"Malformed server.properties at line {line_number}: {exc}. "
+                "Repair the file outside the TUI, then reload."
+            ) from None
+        newline = physical[len(physical.rstrip(b"\r\n")):]
+        values[key] = value
+        records.append(_PropertyRecord(key, start, offset, newline))
+    return values, records
+
+
+def _escape_property(value: str) -> str:
+    result: list[str] = []
+    escapes = {"\\": "\\\\", "\t": "\\t", "\n": "\\n", "\r": "\\r", "\f": "\\f"}
+    for char in value:
+        if char in escapes:
+            result.append(escapes[char])
+        elif char in " =:#!":
+            result.append("\\" + char)
+        elif ord(char) < 32 or ord(char) > 126:
+            # ASCII output is safe for both Java's legacy and UTF-8 readers.
+            encoded = char.encode("utf-16-be")
+            result.extend(
+                f"\\u{int.from_bytes(encoded[index:index + 2], 'big'):04x}"
+                for index in range(0, len(encoded), 2)
+            )
+        else:
+            result.append(char)
+    return "".join(result)
+
+
+def _property_file_from_tar(
+    buf: bytes, member_name: str = "server.properties"
+) -> tuple[bytes, tarfile.TarInfo]:
     try:
         with tarfile.open(fileobj=io.BytesIO(buf), mode="r:*") as archive:
-            member = next(
-                (m for m in archive.getmembers() if m.name.endswith(member_name)),
-                None,
-            )
-            if member is None:
-                return {}
-            content = archive.extractfile(member).read().decode("utf-8", "replace")
-    except (tarfile.TarError, OSError, AttributeError):
-        return {}
+            members = archive.getmembers()
+            if len(members) != 1 or members[0].name.rsplit("/", 1)[-1] != member_name:
+                raise ValueError("The copy stream does not contain exactly one properties file.")
+            member = members[0]
+            if not member.isfile() or member.issparse():
+                raise ValueError("server.properties must be a regular file, not a link or special file.")
+            source = archive.extractfile(member)
+            if source is None:
+                raise ValueError("Cannot read the properties file from the copy stream.")
+            return source.read(), member
+    except (tarfile.TarError, OSError, EOFError):
+        raise ValueError("Invalid properties copy stream; reload after checking the container data volume.") from None
 
-    props: dict[str, str] = {"_raw": content}
-    for line in content.splitlines():
-        if not line or line.startswith("#"):
-            continue
-        key, _, value = line.partition("=")
-        props[key.strip()] = value.strip()
-    return props
+
+def _settings_context(server: ServerConfig) -> tuple[str, str | None]:
+    try:
+        info = inspect_container(server.runtime, server.container)
+    except (RuntimeError, OSError, ValueError, subprocess.SubprocessError):
+        raise RuntimeError("Cannot inspect the container; check runtime access and reload server settings.") from None
+    directory = server.working_dir or container_workdir(info) or "/data"
+    path = directory.rstrip("/") + "/server.properties"
+    blocked = None
+    env = container_env(info)
+    if is_minecraft_image(container_image(info)) and not (
+        env.get("OVERRIDE_SERVER_PROPERTIES", "").casefold() == "false"
+        or env.get("SKIP_SERVER_PROPERTIES", "").casefold() == "true"
+    ):
+        blocked = (
+            "This image manages server.properties on startup. Add "
+            "OVERRIDE_SERVER_PROPERTIES=false to the deployment and recreate "
+            "the container retaining its data volume before saving settings or starting/restarting it."
+        )
+    return path, blocked
+
+
+def _read_settings_file(server: ServerConfig, path: str) -> tuple[bytes, tarfile.TarInfo]:
+    try:
+        buf = _copy_path_stream(server, path)
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        raise RuntimeError(
+            "Cannot read server.properties using container cp; check the data path, "
+            "file permissions and runtime access, then reload."
+        ) from None
+    return _property_file_from_tar(buf)
+
+
+def _podman_properties_owner(server: ServerConfig, path: str) -> tuple[int, int]:
+    """Podman cp normalizes tar ownership, so query the actual file separately."""
+    try:
+        info = inspect_container(server.runtime, server.container)
+        binary = runtime_binary(server.runtime)
+        if (info.get("State") or {}).get("Status") == "running":
+            command = [binary, "exec", server.container, "stat", "-c", "%u %g", "--", path]
+        else:
+            # In the default rootless namespace, volume owners match container IDs.
+            # Refuse custom mappings rather than silently assign a different owner.
+            if (info.get("HostConfig") or {}).get("UsernsMode") not in ("", "private", None):
+                raise ValueError("custom user namespace")
+            mounts = [
+                mount for mount in info.get("Mounts", [])
+                if path.startswith(str(mount.get("Destination", "")).rstrip("/") + "/")
+                and mount.get("Source")
+            ]
+            mount = max(mounts, key=lambda value: len(value["Destination"]))
+            source = str(Path(mount["Source"]) / path[len(mount["Destination"]):].lstrip("/"))
+            command = [binary, "unshare", "stat", "-c", "%u %g", "--", source]
+        uid, gid = run_process(command, timeout=20).split()
+        return int(uid), int(gid)
+    except (RuntimeError, OSError, ValueError, KeyError, subprocess.SubprocessError):
+        raise RuntimeError(
+            "Cannot determine properties file ownership safely. For stopped Podman "
+            "containers, use a persistent data mount and the default user namespace, "
+            "or start the container before editing. No settings were written."
+        ) from None
+
+
+def load_server_settings(server: ServerConfig) -> ServerSettings:
+    path, blocked = _settings_context(server)
+    raw, _ = _read_settings_file(server, path)
+    values, _ = _parse_properties(raw)
+    return ServerSettings(path, raw, values, blocked)
+
+
+def _validate_setting(setting: ServerSetting, value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{setting.label} must be text.")
+    if setting.kind == "bool" and value not in ("true", "false"):
+        raise ValueError(f"{setting.label} must be true or false.")
+    if setting.kind == "choice" and value not in setting.choices:
+        raise ValueError(f"{setting.label} must be one of: {', '.join(setting.choices)}.")
+    if setting.kind == "int":
+        if not re.fullmatch(r"[0-9]{1,10}", value):
+            raise ValueError(f"{setting.label} must be a whole number.")
+        number = int(value)
+        if number < setting.minimum or number > setting.maximum:
+            raise ValueError(f"{setting.label} must be between {setting.minimum} and {setting.maximum}.")
+    if setting.kind == "text":
+        if any((ord(char) < 32 and char not in "\t\n\r") or 127 <= ord(char) <= 159
+               or 0xD800 <= ord(char) <= 0xDFFF for char in value):
+            raise ValueError("MOTD cannot contain NUL, control characters or unpaired Unicode surrogates.")
+        value = value.replace("\r\n", "\n").replace("\r", "\n")
+    return value
+
+
+def save_server_settings(
+    server: ServerConfig, snapshot: ServerSettings, changes: dict[str, str]
+) -> ServerSettings:
+    """Apply validated edits; restart is manual.
+
+    cp has no atomic compare-and-swap: an external writer can still race between
+    the final read and extraction. Raw comparison catches edits before that gap.
+    """
+    values, records = _parse_properties(snapshot.raw)
+    allowed = {setting.key: setting for setting in SETTINGS}
+    updates: dict[str, str] = {}
+    for key, value in changes.items():
+        if key not in allowed:
+            raise ValueError("Only the listed server settings may be changed.")
+        if key not in values:
+            raise ValueError(f"{allowed[key].label} is absent from this server.properties; reload without adding defaults.")
+        validated = _validate_setting(allowed[key], value)
+        if validated != values[key]:
+            updates[key] = validated
+    if not updates:
+        return snapshot
+    path, blocked = _settings_context(server)
+    if path != snapshot.path:
+        raise RuntimeError("The server data path changed; reload settings before saving.")
+    if blocked:
+        raise RuntimeError(blocked)
+    last_records = {record.key: record for record in records}
+    edited = sorted((last_records[key] for key in updates), key=lambda record: record.start)
+    chunks: list[bytes] = []
+    offset = 0
+    for record in edited:
+        chunks.append(snapshot.raw[offset:record.start])
+        line = f"{_escape_property(record.key)}={_escape_property(updates[record.key])}"
+        chunks.append(line.encode("ascii") + record.newline)
+        offset = record.end
+    chunks.append(snapshot.raw[offset:])
+    payload = b"".join(chunks)
+    latest, original = _read_settings_file(server, path)
+    if latest != snapshot.raw:
+        raise RuntimeError("server.properties changed outside the TUI; reload settings before saving.")
+    if original.mode & 0o222 == 0:
+        raise RuntimeError("server.properties is read-only; correct its permissions outside the TUI, then reload.")
+    target = tarfile.TarInfo("server.properties")
+    for attribute in ("mode", "uid", "gid", "uname", "gname", "mtime"):
+        setattr(target, attribute, getattr(original, attribute))
+    if server.runtime == "podman":
+        target.uid, target.gid = _podman_properties_owner(server, path)
+        target.uname = target.gname = ""
+    target.size = len(payload)
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        archive.addfile(target, io.BytesIO(payload))
+    try:
+        proc = subprocess.run(
+            [runtime_binary(server.runtime), "cp",
+             "--archive=false" if server.runtime == "podman" else "-a",
+             "-", f"{server.container}:{path.rsplit('/', 1)[0] or '/'}"],
+            input=buffer.getvalue(), capture_output=True, timeout=120,
+        )
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        raise RuntimeError(
+            "Cannot write server.properties using container cp; check volume permissions "
+            "and read-only mounts. Reload before retrying: the copy may have partially completed."
+        ) from None
+    if proc.returncode:
+        raise RuntimeError(
+            "Cannot write server.properties using container cp; check volume permissions "
+            "and read-only mounts. Reload before retrying: the copy may have partially completed."
+        )
+    saved = load_server_settings(server)
+    if any(saved.values.get(key) != value for key, value in updates.items()):
+        raise RuntimeError("The copied server.properties did not retain the changes; another process may manage it. Reload settings.")
+    return saved
+
+
+def _properties_from_tar(buf: bytes, member_name: str = "server.properties") -> dict:
+    """Best-effort decoded metadata; malformed files must not break status views."""
+    try:
+        raw, _ = _property_file_from_tar(buf, member_name)
+        values, _ = _parse_properties(raw)
+    except ValueError:
+        return {}
+    return {**values, "_raw": _properties_text(raw)}
 
 
 def container_level_name(server: ServerConfig) -> str:

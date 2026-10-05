@@ -1,17 +1,21 @@
 import io
 import json
+import subprocess
 import tarfile
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
+from contextlib import ExitStack
 
 from mc_admin_core import (
     DiscoveredServer,
     Kit,
     Location,
     ServerConfig,
+    SETTINGS,
+    ServerSettings,
     _properties_from_tar,
     _uptime_text,
     all_kits,
@@ -34,6 +38,7 @@ from mc_admin_core import (
     load_items,
     load_last_server,
     load_locations,
+    load_server_settings,
     load_server_configs,
     locations_path_for,
     parse_dimension,
@@ -43,13 +48,17 @@ from mc_admin_core import (
     parse_position,
     prune_backups,
     rcon,
+    restart_container,
     restore_procedure,
     rule_name,
     safe_filename,
     save_custom_kits,
     save_locations,
+    save_server_settings,
     scan_servers,
     server_config_for,
+    start_container,
+    stop_container,
     upsert_server_config,
 )
 
@@ -638,36 +647,428 @@ class RegistryTests(unittest.TestCase):
                 items_from_registry(path)
 
 
-class BindingTests(unittest.TestCase):
-    def test_tab_hotkeys_bound(self):
-        from mc_admin_tui import MinecraftAdminApp
+class ContainerLifecycleTests(unittest.TestCase):
+    def test_managed_image_without_required_options_cannot_start_or_restart(self):
+        server = ServerConfig("podman", "mc_one")
+        info = {"Config": {"Image": "itzg/minecraft-server", "Env": ["RCON_PASSWORD=DO_NOT_LEAK"]}}
+        with patch("mc_admin_core.inspect_container", return_value=info), patch("mc_admin_core.run_process") as run:
+            for operation in (start_container, restart_container):
+                with self.subTest(operation=operation.__name__), self.assertRaisesRegex(RuntimeError, "OVERRIDE_SERVER_PROPERTIES=false") as error:
+                    operation(server)
+                self.assertNotIn("DO_NOT_LEAK", str(error.exception))
+            run.assert_not_called()
 
-        keymap: dict[str, str] = {}
-        for binding in MinecraftAdminApp.BINDINGS:
-            if isinstance(binding, tuple):
-                key, action = binding[0], binding[1]
-            else:
-                key, action = binding.key, binding.action
-            for key_part in str(key).split(","):
-                keymap[key_part] = action
-        expected = {
-            "g": "give-tab",
-            "k": "kits-tab",
-            "t": "teleport-tab",
-            "w": "world-tab",
-            "s": "server-tab",
-            "a": "activity-tab",
-            "f": "fun-tab",
+    def test_inspection_failure_does_not_launch_container(self):
+        with patch("mc_admin_core.inspect_container", side_effect=RuntimeError("DO_NOT_LEAK")), patch(
+            "mc_admin_core.run_process"
+        ) as run:
+            for operation in (start_container, restart_container):
+                with self.subTest(operation=operation.__name__), self.assertRaisesRegex(RuntimeError, "Cannot inspect") as error:
+                    operation(ServerConfig("docker", "mc_one"))
+                self.assertNotIn("DO_NOT_LEAK", str(error.exception))
+            run.assert_not_called()
+
+
+def _settings_tar(raw: bytes, kind=tarfile.REGTYPE, mode=0o640, owner=(1001, 1002)) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        member = tarfile.TarInfo("server.properties")
+        member.type = kind
+        member.mode = mode
+        member.uid, member.gid = owner
+        member.uname, member.gname = "minecraft", "minecraft"
+        member.mtime = 123456789
+        if kind == tarfile.REGTYPE:
+            member.size = len(raw)
+            archive.addfile(member, io.BytesIO(raw))
+        else:
+            member.linkname = "/etc/unrelated"
+            archive.addfile(member)
+    return buffer.getvalue()
+
+
+class _SettingsContainer:
+    """Deterministic cp transport with a persistent in-memory container file."""
+
+    def __init__(self, raw=b"motd=Old\npvp=true\nmax-players=20\n", runtime="podman"):
+        self.raw = raw
+        self.server = ServerConfig(runtime=runtime, container="mc_settings")
+        self.info = {
+            "State": {"Status": "running"},
+            "Config": {
+                "Image": "itzg/minecraft-server:latest",
+                "Env": ["OVERRIDE_SERVER_PROPERTIES=false"],
+                "WorkingDir": "/data",
+            }
         }
-        for letter, tab in expected.items():
-            for prefix in ("", "ctrl+", "alt+"):
-                action = keymap.get(f"{prefix}{letter}")
-                self.assertEqual(
-                    action, f"show_tab('{tab}')", f"{prefix}{letter} -> {action}"
-                )
-        for prefix in ("", "ctrl+", "alt+"):
-            self.assertEqual(keymap[f"{prefix}b"], "open_backups")
-        self.assertEqual(keymap["alt+r"], "scan_servers")
+        self.reads = 0
+        self.writes = []
+        self.commands = []
+        self.mode = 0o640
+        self.kind = tarfile.REGTYPE
+        self.owner = (1001, 1002)
+        self.copy_owner = self.owner
+        self.fail_read = False
+        self.fail_write = False
+        self.write_exception = None
+        self.after_write = None
+        self.written_member = None
+        self.stack = ExitStack()
+
+    def __enter__(self):
+        self.stack.enter_context(patch("mc_admin_core.inspect_container", side_effect=lambda *_: self.info))
+        self.stack.enter_context(patch("mc_admin_core.shutil.which", return_value="/usr/bin/runtime"))
+        self.stack.enter_context(patch("mc_admin_core.subprocess.run", side_effect=self.run))
+        return self
+
+    def __exit__(self, *args):
+        return self.stack.__exit__(*args)
+
+    def run(self, args, **kwargs):
+        if "stat" in args and ("exec" in args or "unshare" in args):
+            return subprocess.CompletedProcess(args, 0, f"{self.owner[0]} {self.owner[1]}", "")
+        self.commands.append(args)
+        if "input" not in kwargs:
+            self.reads += 1
+            if self.fail_read:
+                return subprocess.CompletedProcess(args, 1, b"", b"rcon.password=DO_NOT_LEAK")
+            return subprocess.CompletedProcess(args, 0, _settings_tar(self.raw, self.kind, self.mode, self.copy_owner), b"")
+        self.writes.append(kwargs["input"])
+        if self.write_exception:
+            raise self.write_exception
+        if self.fail_write:
+            return subprocess.CompletedProcess(args, 1, b"", b"rcon.password=DO_NOT_LEAK")
+        with tarfile.open(fileobj=io.BytesIO(kwargs["input"])) as archive:
+            self.written_member = archive.getmembers()[0]
+            self.raw = archive.extractfile(self.written_member).read()
+            self.owner = (
+                (0, 0) if self.server.runtime == "podman" and "--archive=false" not in args
+                else (self.written_member.uid, self.written_member.gid)
+            )
+        if self.after_write is not None:
+            self.raw = self.after_write
+        return subprocess.CompletedProcess(args, 0, b"", b"")
+
+
+class ServerSettingsTests(unittest.TestCase):
+    def test_java_properties_decoding_and_duplicates(self):
+        raw = (
+            b"  # comment\\\r\n\t!another comment\r\n"
+            b"motd : Hello\\u0020\\u00e9\\uD83D\\uDE00\\nline\\tend\r\n"
+            b"pvp=true\r\npvp false\r\n"
+            b"escaped\\ key\\:\\==value\\=with\\:separators  \r\n"
+            b"continued=one\\\r\n \t\ftwo\\\r\n  three\r\n"
+            b"empty\r\nunknown\\q=slash\\\\and\\fpage\r"
+        )
+        with _SettingsContainer(raw) as container:
+            loaded = load_server_settings(container.server)
+        self.assertEqual(loaded.raw, raw)
+        self.assertEqual(loaded.values["motd"], "Hello é😀\nline\tend")
+        self.assertEqual(loaded.values["pvp"], "false")
+        self.assertEqual(loaded.values["escaped key:="], "value=with:separators  ")
+        self.assertEqual(loaded.values["continued"], "onetwothree")
+        self.assertEqual(loaded.values["empty"], "")
+        self.assertEqual(loaded.values["unknownq"], "slash\\and\fpage")
+        self.assertEqual(loaded.path, "/data/server.properties")
+        self.assertIsNone(loaded.write_blocked)
+        self.assertEqual(container.writes, [])
+
+    def test_save_preserves_all_unrelated_bytes_and_effective_duplicate(self):
+        raw = (
+            b"# comment\r\npvp=true\r\nrcon.password=secret\\=keep  \r\n"
+            b"motd=earlier duplicate\r\n !important\r\nmotd : before\\\r\n"
+            b"  continuation\r\npvp : false\r\nunknown= untouched  "
+        )
+        motd = " leading é😀\\path\nSecond\tline:=#! "
+        expected = (
+            b"# comment\r\npvp=true\r\nrcon.password=secret\\=keep  \r\n"
+            b"motd=earlier duplicate\r\n !important\r\n"
+            b"motd=\\ leading\\ \\u00e9\\ud83d\\ude00\\\\path\\nSecond\\tline\\:\\=\\#\\!\\ \r\n"
+            b"pvp=true\r\nunknown= untouched  "
+        )
+        for runtime in ("podman", "docker"):
+            with self.subTest(runtime=runtime), _SettingsContainer(raw, runtime) as container:
+                loaded = load_server_settings(container.server)
+                saved = save_server_settings(container.server, loaded, {"motd": motd, "pvp": "true"})
+                self.assertEqual(container.raw, expected)
+                self.assertEqual(saved.raw, expected)
+                self.assertEqual(saved.values["motd"], motd)
+                self.assertEqual(saved.values["pvp"], "true")
+                self.assertEqual(saved.values["rcon.password"], "secret=keep  ")
+                self.assertEqual(len(container.writes), 1)
+                member = container.written_member
+                self.assertEqual((member.name, member.mode, member.uid, member.gid),
+                                 ("server.properties", 0o640, 1001, 1002))
+
+    def test_podman_save_preserves_actual_owner_not_normalized_copy_owner(self):
+        for running in (True, False):
+            with self.subTest(running=running), _SettingsContainer() as container:
+                container.copy_owner = (0, 0)
+                container.info["State"]["Status"] = "running" if running else "exited"
+                container.info["Mounts"] = [{"Source": "/persistent", "Destination": "/data"}]
+                loaded = load_server_settings(container.server)
+                saved = save_server_settings(container.server, loaded, {"motd": "Updated"})
+                self.assertEqual(saved.values["motd"], "Updated")
+                self.assertEqual(container.owner, (1001, 1002))
+
+    def test_motd_line_endings_are_normalized_and_eof_is_preserved(self):
+        with _SettingsContainer(b"motd=before") as container:
+            loaded = load_server_settings(container.server)
+            saved = save_server_settings(container.server, loaded, {"motd": "one\r\ntwo\rthree"})
+            self.assertEqual(saved.values["motd"], "one\ntwo\nthree")
+            self.assertEqual(container.raw, b"motd=one\\ntwo\\nthree")
+
+    def test_native_unicode_and_legacy_latin1_are_read_without_rewriting(self):
+        for raw in ("motd=café\n".encode(), b"motd=caf\xe9\n"):
+            with self.subTest(raw=raw), _SettingsContainer(raw) as container:
+                loaded = load_server_settings(container.server)
+                self.assertEqual(loaded.values["motd"], "café")
+                self.assertIs(save_server_settings(container.server, loaded, {"motd": "café"}), loaded)
+                self.assertEqual(container.raw, raw)
+                self.assertEqual(container.writes, [])
+
+    def test_working_directory_priority_and_fallback(self):
+        for configured, detected, expected in (
+            ("/custom/", "/detected", "/custom/server.properties"),
+            (None, "/detected", "/detected/server.properties"),
+            (None, "", "/data/server.properties"),
+            ("/", "/detected", "/server.properties"),
+        ):
+            with self.subTest(expected=expected), _SettingsContainer() as container:
+                container.server = ServerConfig("docker", "mc_settings", working_dir=configured)
+                container.info["Config"]["WorkingDir"] = detected
+                self.assertEqual(load_server_settings(container.server).path, expected)
+
+    def test_managed_image_blocks_without_safe_environment_flag(self):
+        for env in ([], ["OVERRIDE_SERVER_PROPERTIES=true"], ["SKIP_SERVER_PROPERTIES=false"],
+                    ["OVERRIDE_SERVER_PROPERTIES=not-false"]):
+            with self.subTest(env=env), _SettingsContainer() as container:
+                container.info["Config"]["Env"] = env + ["RCON_PASSWORD=DO_NOT_LEAK"]
+                loaded = load_server_settings(container.server)
+                self.assertIn("OVERRIDE_SERVER_PROPERTIES=false", loaded.write_blocked)
+                self.assertIn("retaining its data volume", loaded.write_blocked)
+                self.assertNotIn("DO_NOT_LEAK", loaded.write_blocked)
+                with self.assertRaisesRegex(RuntimeError, "recreate"):
+                    save_server_settings(container.server, loaded, {"motd": "new"})
+                self.assertEqual(container.writes, [])
+
+    def test_safe_environment_flags_are_case_insensitive(self):
+        for env in (["override_server_properties=FALSE"], ["skip_server_properties=TrUe"]):
+            with self.subTest(env=env), _SettingsContainer() as container:
+                container.info["Config"]["Env"] = env
+                loaded = load_server_settings(container.server)
+                self.assertIsNone(loaded.write_blocked)
+                self.assertEqual(save_server_settings(container.server, loaded, {"motd": "new"}).values["motd"], "new")
+
+    def test_generic_images_are_editable_without_itzg_flags(self):
+        with _SettingsContainer() as container:
+            container.info["Config"] = {"Image": "local/minecraft-custom", "WorkingDir": "/data"}
+            loaded = load_server_settings(container.server)
+            self.assertIsNone(loaded.write_blocked)
+            saved = save_server_settings(container.server, loaded, {"pvp": "false"})
+            self.assertEqual(saved.values["pvp"], "false")
+
+    def test_policy_and_path_are_checked_again_before_save(self):
+        for mutation, error in (
+            (lambda c: c.info["Config"].update(Env=[]), "startup"),
+            (lambda c: c.info["Config"].update(WorkingDir="/other"), "data path changed"),
+        ):
+            with self.subTest(error=error), _SettingsContainer() as container:
+                loaded = load_server_settings(container.server)
+                mutation(container)
+                with self.assertRaisesRegex(RuntimeError, error):
+                    save_server_settings(container.server, loaded, {"motd": "new"})
+                self.assertEqual(container.writes, [])
+
+    def test_no_changes_or_same_values_never_copy_into_container(self):
+        with _SettingsContainer() as container:
+            container.info["Config"]["Env"] = []
+            loaded = load_server_settings(container.server)
+            for changes in ({}, {"motd": "Old", "pvp": "true"}):
+                self.assertIs(save_server_settings(container.server, loaded, changes), loaded)
+            self.assertEqual(container.writes, [])
+            self.assertEqual(container.reads, 1)
+
+    def test_batch_validation_rejects_without_any_write(self):
+        raw = (
+            b"motd=Old\npvp=true\nmax-players=20\ndifficulty=easy\ngamemode=survival\n"
+            b"view-distance=10\nsimulation-distance=10\nspawn-protection=16\nplayer-idle-timeout=0\n"
+        )
+        invalid = (
+            {"rcon.password": "new"}, {"allow-flight": "true"}, {"pvp": "TRUE"},
+            {"pvp": "false "}, {"difficulty": "extreme"}, {"difficulty": "2"},
+            {"gamemode": "invalid"}, {"max-players": "0"}, {"max-players": "2147483648"},
+            {"max-players": "-1"}, {"max-players": "2.5"}, {"max-players": " 20"},
+            {"view-distance": "1"}, {"view-distance": "33"},
+            {"simulation-distance": "1"}, {"simulation-distance": "33"},
+            {"spawn-protection": "-1"}, {"spawn-protection": "2147483648"},
+            {"player-idle-timeout": "-1"}, {"player-idle-timeout": "2147483648"},
+            {"motd": "NUL\0"}, {"motd": "form\f"}, {"motd": "delete\x7f"},
+            {"motd": "control\x85"}, {"motd": "\ud800"}, {"motd": 123},
+        )
+        with _SettingsContainer(raw) as container:
+            loaded = load_server_settings(container.server)
+            for changes in invalid:
+                with self.subTest(changes=changes), self.assertRaises(ValueError):
+                    save_server_settings(container.server, loaded, {"motd": "otherwise valid", **changes})
+            self.assertEqual(container.writes, [])
+            self.assertEqual(container.reads, 1)
+            self.assertEqual(container.raw, raw)
+
+    def test_valid_numeric_boundaries(self):
+        raw = (b"max-players=20\nview-distance=10\nsimulation-distance=10\n"
+               b"spawn-protection=16\nplayer-idle-timeout=10\n")
+        with _SettingsContainer(raw) as container:
+            loaded = load_server_settings(container.server)
+            for changes in (
+                {"max-players": "1", "view-distance": "2", "simulation-distance": "2",
+                 "spawn-protection": "0", "player-idle-timeout": "0"},
+                {"max-players": "2147483647", "view-distance": "32", "simulation-distance": "32",
+                 "spawn-protection": "2147483647", "player-idle-timeout": "2147483647"},
+            ):
+                loaded = save_server_settings(container.server, loaded, changes)
+                for key, value in changes.items():
+                    self.assertEqual(loaded.values[key], value)
+
+    def test_concurrent_edit_is_not_overwritten(self):
+        with _SettingsContainer() as container:
+            loaded = load_server_settings(container.server)
+            container.raw += b"# external edit\n"
+            latest = container.raw
+            with self.assertRaisesRegex(RuntimeError, "changed outside"):
+                save_server_settings(container.server, loaded, {"motd": "new"})
+            self.assertEqual(container.writes, [])
+            self.assertEqual(container.raw, latest)
+
+    def test_mutable_snapshot_values_cannot_inject_or_hide_file_properties(self):
+        with _SettingsContainer() as container:
+            loaded = load_server_settings(container.server)
+            loaded.values["allow-flight"] = "false"
+            loaded.values["motd"] = "fake"
+            with self.assertRaisesRegex(ValueError, "absent"):
+                save_server_settings(container.server, loaded, {"allow-flight": "true"})
+            saved = save_server_settings(container.server, loaded, {"motd": "fake"})
+            self.assertEqual(saved.values["motd"], "fake")
+            self.assertEqual(len(container.writes), 1)
+
+    def test_malformed_files_fail_without_leaking_unknown_values(self):
+        for raw in (
+            b"rcon.password=DO_NOT_LEAK\\u123\nmotd=old\n",
+            b"motd=old\\", b"motd=old\\\n",
+            b"rcon.password=DO_NOT_LEAK\\ud800\n",
+            b"rcon.password=DO_NOT_LEAK\0\n",
+        ):
+            with self.subTest(raw=raw), _SettingsContainer(raw) as container:
+                with self.assertRaisesRegex(ValueError, "Malformed server.properties") as error:
+                    load_server_settings(container.server)
+                self.assertNotIn("DO_NOT_LEAK", str(error.exception))
+                snapshot = ServerSettings("/data/server.properties", raw, {})
+                with self.assertRaises(ValueError):
+                    save_server_settings(container.server, snapshot, {"motd": "new"})
+                self.assertEqual(container.writes, [])
+                self.assertEqual(_properties_from_tar(_settings_tar(raw)), {})
+
+    def test_non_regular_files_are_rejected_on_load_and_recheck(self):
+        for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.DIRTYPE, tarfile.FIFOTYPE):
+            with self.subTest(kind=kind), _SettingsContainer() as container:
+                loaded = load_server_settings(container.server)
+                container.kind = kind
+                with self.assertRaisesRegex(ValueError, "regular file"):
+                    load_server_settings(container.server)
+                with self.assertRaisesRegex(ValueError, "regular file"):
+                    save_server_settings(container.server, loaded, {"motd": "new"})
+                self.assertEqual(container.writes, [])
+
+    def test_readonly_mode_does_not_attempt_write(self):
+        with _SettingsContainer() as container:
+            loaded = load_server_settings(container.server)
+            container.mode = 0o444
+            with self.assertRaisesRegex(RuntimeError, "read-only"):
+                save_server_settings(container.server, loaded, {"motd": "new"})
+            self.assertEqual(container.writes, [])
+
+    def test_copy_failures_are_actionable_and_do_not_leak_output(self):
+        with _SettingsContainer() as container:
+            container.fail_read = True
+            with self.assertRaisesRegex(RuntimeError, "Cannot read") as error:
+                load_server_settings(container.server)
+            self.assertNotIn("DO_NOT_LEAK", str(error.exception))
+            self.assertEqual(container.writes, [])
+        with _SettingsContainer() as container:
+            loaded = load_server_settings(container.server)
+            container.fail_read = True
+            with self.assertRaisesRegex(RuntimeError, "Cannot read"):
+                save_server_settings(container.server, loaded, {"motd": "new"})
+            self.assertEqual(container.writes, [])
+        with _SettingsContainer() as container:
+            loaded = load_server_settings(container.server)
+            container.fail_write = True
+            with self.assertRaisesRegex(RuntimeError, "read-only mounts") as error:
+                save_server_settings(container.server, loaded, {"motd": "new"})
+            self.assertNotIn("DO_NOT_LEAK", str(error.exception))
+            self.assertEqual(container.raw, loaded.raw)
+            self.assertEqual(len(container.writes), 1)
+        with _SettingsContainer() as container:
+            loaded = load_server_settings(container.server)
+            container.write_exception = subprocess.TimeoutExpired("DO_NOT_LEAK", 120)
+            with self.assertRaisesRegex(RuntimeError, "partially completed") as error:
+                save_server_settings(container.server, loaded, {"motd": "new"})
+            self.assertNotIn("DO_NOT_LEAK", str(error.exception))
+
+    def test_invalid_or_ambiguous_copy_streams_are_never_written(self):
+        empty = io.BytesIO()
+        with tarfile.open(fileobj=empty, mode="w"):
+            pass
+        ambiguous = io.BytesIO()
+        with tarfile.open(fileobj=ambiguous, mode="w") as archive:
+            for _ in range(2):
+                member = tarfile.TarInfo("server.properties")
+                member.size = 9
+                archive.addfile(member, io.BytesIO(b"motd=old\n"))
+        wrong_name = io.BytesIO()
+        with tarfile.open(fileobj=wrong_name, mode="w") as archive:
+            member = tarfile.TarInfo("not-server.properties")
+            member.size = 9
+            archive.addfile(member, io.BytesIO(b"motd=old\n"))
+        for stream in (b"invalid", empty.getvalue(), ambiguous.getvalue(), wrong_name.getvalue()):
+            with self.subTest(stream=stream[:10]), _SettingsContainer() as container:
+                loaded = load_server_settings(container.server)
+                with patch("mc_admin_core._copy_path_stream", return_value=stream):
+                    with self.assertRaises(ValueError):
+                        save_server_settings(container.server, loaded, {"motd": "new"})
+                    with self.assertRaises(ValueError):
+                        load_server_settings(container.server)
+                self.assertEqual(container.writes, [])
+                self.assertEqual(_properties_from_tar(stream), {})
+
+    def test_all_catalogued_boolean_and_choice_values_are_editable(self):
+        settings = [setting for setting in SETTINGS if setting.kind in ("bool", "choice")]
+        raw = "".join(
+            f"{setting.key}={'false' if setting.kind == 'bool' else setting.choices[0]}\n"
+            for setting in settings
+        ).encode()
+        with _SettingsContainer(raw) as container:
+            loaded = load_server_settings(container.server)
+            changes = {setting.key: "true" for setting in settings if setting.kind == "bool"}
+            loaded = save_server_settings(container.server, loaded, changes)
+            for key in changes:
+                self.assertEqual(loaded.values[key], "true")
+            for setting in settings:
+                for choice in setting.choices:
+                    loaded = save_server_settings(container.server, loaded, {setting.key: choice})
+                    self.assertEqual(loaded.values[setting.key], choice)
+
+    def test_reloaded_file_not_assumed_to_match_write(self):
+        with _SettingsContainer() as container:
+            loaded = load_server_settings(container.server)
+            container.after_write = b"motd=startup managed\n"
+            with self.assertRaisesRegex(RuntimeError, "did not retain"):
+                save_server_settings(container.server, loaded, {"motd": "new"})
+
+    def test_metadata_parser_is_tolerant_and_decodes_motd(self):
+        self.assertEqual(_properties_from_tar(b"not a tar"), {})
+        self.assertEqual(_properties_from_tar(_settings_tar(b"motd=a\\u00e9\\nnext\n"))["motd"], "aé\nnext")
+        self.assertEqual(_properties_from_tar(_settings_tar(b"", tarfile.SYMTYPE)), {})
 
 
 if __name__ == "__main__":
