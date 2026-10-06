@@ -162,6 +162,24 @@ def checked_command(client, command: str) -> str:
     return result
 
 
+def refresh_datapack(config: dict):
+    """Refresh the installed hub pack using fresh RCON sessions.
+
+    Vanilla 26.3 does not expose the legacy ``reload`` command. Disabling and
+    re-enabling the file pack also avoids reusing an RCON stream across the
+    datapack lifecycle transition.
+    """
+    from mc_hub import RconClient
+    quote = chr(34)
+    for action in ("disable", "enable"):
+        client = RconClient(config["rcon_host"], config["rcon_port"], config["rcon_password"])
+        try:
+            checked_command(client, f"datapack {action} {quote}file/hub{quote}")
+        finally:
+            client.close()
+    return wait_for_hub(config)
+
+
 def wait_for_chunks(client, bounds: tuple[int, int, int, int], timeout: int = 180) -> None:
     pending = {(x, z) for x in range(bounds[0], bounds[2] + 1, 16)
                for z in range(bounds[1], bounds[3] + 1, 16)}
@@ -225,6 +243,7 @@ def deploy(args) -> None:
         config = {"hub": {"container": args.container, "rcon_host": "127.0.0.1", "rcon_port": args.rcon_port,
                           "rcon_password": secrets.token_urlsafe(32), "game_port": args.port},
                   "address": args.address, "admins": [admin["uuid"] for admin in admins], "targets": {},
+                  "features": {"community_messages": True},
                   "poll_seconds": 1, "scan_seconds": 10}
         state = {"slots": {}, "generated": []}
         volume = args.container + "_data"
@@ -256,6 +275,10 @@ def deploy(args) -> None:
             "server.properties": "".join(f"{key}={value}\n" for key, value in properties.items()),
         })
         private_json(config_path, config)
+    features = config.get("features", {})
+    if not isinstance(features, dict) or type(features.get("community_messages", True)) is not bool:
+        raise ValueError("features.community_messages must be a boolean")
+    community_messages = features.get("community_messages", True)
     inventory = list_containers("podman")
     for item in sorted(inventory, key=container_name):
         name = container_name(item)
@@ -278,8 +301,10 @@ def deploy(args) -> None:
     try:
         slots = [{"id": identifier, "name": name} for name, identifier in sorted(state["slots"].items(), key=lambda pair: pair[1])]
         install_datapack(args.container, datapack_files(slots))
-        checked_command(client, "reload")
-        commands = build_commands(slots)
+        client.close()
+        client = refresh_datapack(config["hub"])
+        commands = build_commands(slots, community_messages=community_messages,
+                                  preserve_submissions=args.rebuild)
         checked_command(client, commands[0])
         wait_for_chunks(client, FORCELOAD_BOUNDS)
         for command in commands[1:]:

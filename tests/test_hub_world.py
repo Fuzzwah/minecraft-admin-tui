@@ -123,7 +123,36 @@ class HubWorldTests(unittest.TestCase):
             for generate in (world.build_commands, world.datapack_files):
                 with self.assertRaises(ValueError):
                     generate(slots)
-        self.assertEqual(world.build_commands([])[0], "forceload add 0 0 255 143")
+        self.assertEqual(world.build_commands([])[0], "forceload add 0 0 255 175")
+
+    def test_community_area_has_sign_supply_wall_and_moderated_channels(self):
+        commands = world.build_commands([])
+        self.assertIn("fill 24 64 166 71 67 166 minecraft:polished_blackstone", commands)
+        self.assertIn("setblock 20 64 156 minecraft:chest[facing=south]", commands)
+        self.assertIn("setblock 80 64 156 minecraft:chest[facing=south]", commands)
+        supply = next(command for command in commands if command.startswith("data merge block 20 64 156"))
+        self.assertIn('minecraft:can_place_on', supply)
+        self.assertIn('minecraft:polished_blackstone', supply)
+        message = next(command for command in commands if command.startswith("setblock 24 64 164"))
+        payload = sign_data(message)
+        self.assertEqual("MESSAGE WALL", payload["front_text"]["messages"][0]["text"])
+        self.assertFalse(any("click_event" in line for line in payload["front_text"]["messages"]))
+
+    def test_community_display_text_rejects_control_and_formatting_characters(self):
+        for invalid in ("line\nnext", "line\rnext", "line\x00", "line§c"):
+            with self.assertRaises(ValueError):
+                world._community_sign(0, 64, 0, [invalid])
+
+    def test_rebuild_preserves_community_submission_containers(self):
+        fresh = world.build_commands([])
+        rebuilt = world.build_commands([], preserve_submissions=True)
+        self.assertIn("setblock 20 64 156 minecraft:chest[facing=south]", fresh)
+        self.assertIn("setblock 80 64 156 minecraft:chest[facing=south]", fresh)
+        self.assertTrue(any(command.startswith("data merge block 20 64 156") for command in fresh))
+        self.assertIn("execute unless block 20 64 156 minecraft:chest run setblock 20 64 156 minecraft:chest[facing=south]", rebuilt)
+        self.assertIn("execute unless block 80 64 156 minecraft:chest run setblock 80 64 156 minecraft:chest[facing=south]", rebuilt)
+        self.assertTrue(any(command.startswith("execute unless data block 20 64 156 Items[0]")
+                            for command in rebuilt))
 
     def test_spawn_floor_and_every_fill_fit_default_modification_limit(self):
         commands = world.build_commands([{"id": 128, "name": "last"}])

@@ -23,7 +23,8 @@ from collections.abc import Iterable, Mapping
 MAX_SLOTS = 128
 DATA_PACK_FORMAT = 121
 SPAWN = (8, 64, 8)
-FORCELOAD_BOUNDS = (0, 0, 255, 143)
+FORCELOAD_BOUNDS = (0, 0, 255, 175)
+COMMUNITY_BOUNDS = (16, 152, 112, 174)
 
 
 def _json(value: object) -> str:
@@ -98,8 +99,10 @@ def _sign_data(lines: Iterable[str], *, color: str = "black", command: str = "",
 
 
 def _sign(x: int, y: int, z: int, lines: Iterable[str], **options) -> str:
-    return (f"setblock {x} {y} {z} minecraft:oak_sign[rotation=8]"
-            + _sign_data(lines, **options))
+    # Vanilla 26.3 rejects block-state and block-entity data in one setblock
+    # argument. The default standing-sign rotation is sufficient for managed
+    # displays, while the optional mode (for example ``keep``) remains valid.
+    return f"setblock {x} {y} {z} minecraft:oak_sign" + _sign_data(lines, **options)
 
 
 def _display_lines(text: str, count: int = 4, width: int = 16) -> list[str]:
@@ -108,6 +111,66 @@ def _display_lines(text: str, count: int = 4, width: int = 16) -> list[str]:
     if len(text) > count * width:
         lines[-1] = lines[-1][:-3] + "..."
     return lines
+
+def _community_lines(lines: Iterable[str]) -> list[str]:
+    text = list(lines)
+    if len(text) > 4:
+        raise ValueError("community signs have at most four lines")
+    for line in text:
+        if not isinstance(line, str) or any(
+            character in "\r\n§" or ord(character) < 32 for character in line
+        ):
+            raise ValueError("community sign text must be plain display text")
+    return text + [""] * (4 - len(text))
+
+
+def _community_sign(x: int, y: int, z: int, lines: Iterable[str],
+                    *, color: str = "black") -> str:
+    return _sign(x, y, z, _community_lines(lines), color=color)
+
+
+def community_commands(*, preserve_submissions: bool = False) -> list[str]:
+    """Create the protected community area outside the stable destination bays."""
+    x1, z1, x2, z2 = COMMUNITY_BOUNDS
+    commands = [
+        f"fill 120 63 144 135 63 151 minecraft:polished_andesite",
+        f"fill {x1} 63 {z1} {x2} 63 {z2} minecraft:stone_bricks",
+        f"fill 15 64 {z1} 15 67 {z2} minecraft:barrier",
+        f"fill 113 64 {z1} 113 67 {z2} minecraft:barrier",
+        f"fill 16 64 151 112 67 151 minecraft:barrier",
+        f"fill 16 64 175 112 67 175 minecraft:barrier",
+        # Open a single managed connector through the former north boundary.
+        "fill 120 64 143 135 67 143 minecraft:air",
+        # Polished blackstone is reserved for the only visitor-editable sign wall.
+        "fill 24 64 166 71 67 166 minecraft:polished_blackstone",
+        _community_sign(20, 64, 154, ["COMMUNITY", "Take signs", "Leave notes", "on the wall"],
+                        color="dark_blue"),
+        _community_sign(24, 64, 164, ["MESSAGE WALL", "Signs only", "Plain text", "No commands"],
+                        color="dark_green"),
+        _community_sign(80, 64, 154, ["SUGGESTIONS", "Write a book", "Drop it below", "Admin review"],
+                        color="dark_purple"),
+        _community_sign(88, 64, 154, ["NOTICE BOARD", "Server news", "Events", "Admin managed"],
+                        color="gold"),
+        _community_sign(96, 64, 154, ["SHOWCASE", "Community", "Achievements", "Admin managed"],
+                        color="dark_aqua"),
+    ]
+    sign_items = (
+        '{Items:[{slot:0,id:"minecraft:oak_sign",count:16,'
+        'components:{"minecraft:can_place_on":{"blocks":["minecraft:polished_blackstone"]}}}]}'
+    )
+    if preserve_submissions:
+        commands.extend([
+            "execute unless block 20 64 156 minecraft:chest run setblock 20 64 156 minecraft:chest[facing=south]",
+            "execute unless block 80 64 156 minecraft:chest run setblock 80 64 156 minecraft:chest[facing=south]",
+            "execute unless data block 20 64 156 Items[0] run data merge block 20 64 156 " + sign_items,
+        ])
+    else:
+        commands.extend([
+            "setblock 20 64 156 minecraft:chest[facing=south]",
+            "setblock 80 64 156 minecraft:chest[facing=south]",
+            "data merge block 20 64 156 " + sign_items,
+        ])
+    return commands
 
 
 def status_commands(slot: Mapping[str, object], state: str, detail: str = "",
@@ -183,15 +246,22 @@ def bay_commands(slot: Mapping[str, object]) -> list[str]:
     return commands
 
 
-def build_commands(slots: Iterable[Mapping[str, object]]) -> list[str]:
-    """Generate the full platform/plaza and requested stable bays explicitly.
+def build_commands(slots: Iterable[Mapping[str, object]], *,
+                   community_messages: bool = True,
+                   preserve_submissions: bool = False) -> list[str]:
+    """Generate the full platform/plaza, community area, and stable bays.
 
     All 128 bay chunks have floor and stay loaded, even if no containers have
     been discovered yet. No fill operates above the walking floor in a label
     position, so full regeneration preserves the user-owned signs as well.
+    Community submissions are preserved during an explicit rebuild.
     """
+    if type(community_messages) is not bool or type(preserve_submissions) is not bool:
+        raise ValueError("community feature flags must be booleans")
     ordered = _slots(slots)
-    commands = ["forceload add 0 0 255 143"]
+    commands = [f"forceload add {FORCELOAD_BOUNDS[0]} {FORCELOAD_BOUNDS[1]} "
+                f"{FORCELOAD_BOUNDS[2]} {FORCELOAD_BOUNDS[3]}",
+                "forceload remove 0 176 255 191"]
     # Nine separate fills stay below the default max_block_modifications=32768.
     for z in range(0, 144, 16):
         commands.append(f"fill 0 63 {z} 255 63 {z + 15} minecraft:stone_bricks")
@@ -210,6 +280,8 @@ def build_commands(slots: Iterable[Mapping[str, object]]) -> list[str]:
         "setworldspawn 8 64 8",
         "spawnpoint @a 8 64 8",
     ])
+    if community_messages:
+        commands.extend(community_commands(preserve_submissions=preserve_submissions))
     for slot in ordered:
         commands.extend(bay_commands(slot))
     return commands
