@@ -99,8 +99,10 @@ def _sign_data(lines: Iterable[str], *, color: str = "black", command: str = "",
 
 
 def _sign(x: int, y: int, z: int, lines: Iterable[str], **options) -> str:
-    return (f"setblock {x} {y} {z} minecraft:oak_sign[rotation=8]"
-            + _sign_data(lines, **options))
+    # Vanilla 26.3 rejects block-state and block-entity data in one setblock
+    # argument. The default standing-sign rotation is sufficient for managed
+    # displays, while the optional mode (for example ``keep``) remains valid.
+    return f"setblock {x} {y} {z} minecraft:oak_sign" + _sign_data(lines, **options)
 
 
 def _display_lines(text: str, count: int = 4, width: int = 16) -> list[str]:
