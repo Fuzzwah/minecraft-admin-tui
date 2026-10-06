@@ -10,9 +10,11 @@ dependencies = [
 [project.scripts]
 mc-admin-tui = "mc_admin_tui:main"
 mc-give-tui = "mc_admin_tui:main"
+mc-hub = "mc_hub:main"
+mc-hub-deploy = "mc_hub_deploy:main"
 
 [tool.setuptools]
-py-modules = ["mc_admin_tui", "mc_admin_core", "mc_give_tui"]
+py-modules = ["mc_admin_tui", "mc_admin_core", "mc_give_tui", "mc_hub", "mc_hub_world", "mc_hub_deploy"]
 
 [tool.setuptools.package-data]
 "*" = ["registries.json"]
