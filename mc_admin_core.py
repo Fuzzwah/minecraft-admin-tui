@@ -418,6 +418,12 @@ def _rcon_settings_from_container(
             key, _, value = line.partition(":")
         key = key.strip().lower()
         value = value.strip().strip('"').strip("'")
+        if section == "auth":
+            # server.properties is Java properties: unescape (`\=`, `\uXXXX`, …).
+            try:
+                value = _unescape_property(value)
+            except ValueError:
+                pass
         if key in ("rcon.password", "password") and value and password is None:
             password = value
         elif key in ("rcon.port", "port") and value.isdigit() and port is None:
@@ -565,6 +571,19 @@ def restart_container(server: ServerConfig) -> str:
     return container_command(server, "restart", "--time", str(grace), timeout=grace + 30)
 
 
+def container_host_port(info: dict, container_port: int = 25565) -> int | None:
+    """Published host port for the server's game port, when one is mapped."""
+    bindings = (info.get("HostConfig") or {}).get("PortBindings") or {}
+    for spec, mappings in bindings.items():
+        if not str(spec).startswith(f"{container_port}/"):
+            continue
+        for mapping in mappings or []:
+            host = str(mapping.get("HostPort") or "")
+            if host.isdigit():
+                return int(host)
+    return None
+
+
 def server_stats(server: ServerConfig, level_name: str = "world") -> dict:
     """Best-effort server metadata: MC version, uptime, players, world size, motd."""
     stats: dict = {}
@@ -576,6 +595,7 @@ def server_stats(server: ServerConfig, level_name: str = "world") -> dict:
         running = str(state.get("Status") or "").lower() == "running"
         started_at = state.get("StartedAt") or None
         stats["image"] = container_image(info)
+        stats["host_port"] = container_host_port(info)
     except (RuntimeError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
         stats["error"] = str(exc)
         return stats

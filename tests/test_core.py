@@ -138,6 +138,28 @@ class DetectionTests(unittest.TestCase):
         self.assertEqual(container_workdir(info), "/data")
         self.assertEqual(container_env(info)["RCON_PASSWORD"], "secret")
 
+    def test_container_host_port(self):
+        from mc_admin_core import container_host_port
+
+        info = {
+            "HostConfig": {
+                "PortBindings": {
+                    "25565/tcp": [{"HostIp": "0.0.0.0", "HostPort": "25567"}],
+                    "25575/tcp": [{"HostIp": "0.0.0.0", "HostPort": "25575"}],
+                }
+            }
+        }
+        self.assertEqual(container_host_port(info), 25567)
+        self.assertEqual(container_host_port({"HostConfig": {}}), None)
+        self.assertEqual(
+            container_host_port(
+                {"HostConfig": {"PortBindings": {"25565/tcp": []}}}
+            ),
+            None,
+        )
+        # an explicit container port selects that binding
+        self.assertEqual(container_host_port(info, 25575), 25575)
+
     def test_scan_servers_filters_and_detects(self):
         containers = [
             {
@@ -1132,6 +1154,21 @@ class RconAuthTests(unittest.TestCase):
         ):
             password, _port, _working_dir = _rcon_settings_from_container("podman", "mc")
         self.assertEqual(password, "YAML")
+
+    def test_server_properties_password_is_unescaped(self):
+        """Java escapes a literal '=' as '\\='; the decoded password must be used."""
+        from mc_admin_core import _rcon_settings_from_container
+
+        output = (
+            "###auth\n"
+            "rcon.password=abc\\=def\n"
+            "rcon.port=25575\n"
+        )
+        with patch("mc_admin_core.shutil.which", return_value="/usr/bin/podman"), patch(
+            "mc_admin_core.run_process", return_value=output
+        ):
+            password, _port, _working_dir = _rcon_settings_from_container("podman", "mc")
+        self.assertEqual(password, "abc=def")
 
 
 if __name__ == "__main__":

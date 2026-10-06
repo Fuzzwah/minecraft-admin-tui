@@ -11,8 +11,8 @@ operate on those same targets.
 ![Minecraft Admin TUI — server info banner, Player tab with inventory](docs/demo.png)
 
 The top section shows, for the selected server: runtime, image, Minecraft version,
-state, uptime, online players and world size — with **Settings** and **Backups**
-buttons that open their respective managers as modals.
+state, uptime, online players, world size and the published game port — with
+**Settings** and **Backups** buttons that open their respective managers as modals.
 
 ![Minecraft Admin TUI — Give tab with fuzzy item search](docs/demo-give.png)
 
@@ -47,6 +47,8 @@ greyed in the list).
 - **Scan** (left) and **Add** (right) around the server picker
 - collapsible details for the selected server: runtime, image, **Minecraft version**,
   state, **uptime**, **online players**, **world size**, MOTD
+- **port** — the published host port for the game (`port 25567`), or `port unmapped`
+  when the game port is not published to the host
 - version comes from the itzg `VERSION` env (e.g. `26.3`), from a Docker-version
   server's `mcxbox.properties`, or from the version comment in `server.properties`
 - world size uses `du -sb` when the server is running, else the archive stream

@@ -1351,12 +1351,14 @@ class MinecraftAdminApp(App[None]):
         else:
             players_text = "—"
         size = human_size(stats.get("world_size"))
+        port = stats.get("host_port")
+        network = f"port {port}" if port else "port unmapped"
         lines = [
             f"[b]{escape(self.config.label)}[/b]  ·  {escape(self.config.runtime)}",
             f"[dim]{escape(str(stats.get('image', '')))}[/]",
             f"MC {version}   ·   {state}"
             + (f"   ·   uptime {uptime}" if uptime else ""),
-            f"Players {players_text}   ·   World {size}",
+            f"Players {players_text}   ·   World {size}   ·   {network}",
         ]
         if stats.get("motd"):
             lines.append(f"[dim]motd: {escape(str(stats['motd']))}[/]")
