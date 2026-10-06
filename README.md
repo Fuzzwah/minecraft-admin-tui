@@ -206,6 +206,19 @@ retrying, since the copy may have partially completed.
 
 ![Minecraft Admin TUI — Backups modal](docs/demo-backups.png)
 
+### uNmINeD maps
+
+In the **Backups** modal, choose a discovered world and select **Create uNmINeD
+map**. The TUI runs `save-all`, streams that world out of the container to a
+temporary local copy, then runs `unmined-cli web render`. The map is written under
+`~/minecraft-maps/<container>/<world>/`. After rendering, the TUI starts a read-only
+HTTP server and displays a LAN URL for the map. It binds to the host's detected
+`10.1.1.0/24` address on TCP port `8765`; keep the TUI running while other machines
+view it. Allow that port through the host firewall if needed. The server has no
+authentication: anyone who can reach it can read all maps under
+`~/minecraft-maps/`. Temporary world files are removed after rendering; this does
+not create a backup archive.
+
 ### Activity / Fun
 
 - in-app audit trail for admin actions
@@ -309,6 +322,10 @@ requests. This is vanilla `/transfer`, not a proxy: destinations do not
 automatically return players to the hub when they stop.
 
 ## Install
+The optional **uNmINeD map** action additionally requires the external
+`unmined-cli` executable on `PATH`. It renders a selected world to
+`~/minecraft-maps/<container>/<world>/` and serves it from the Backups modal;
+see [uNmINeD maps](#unmined-maps) for the LAN and firewall requirements.
 
 ```bash
 python -m venv .venv
@@ -379,6 +396,7 @@ hotkeys are suspended so its editors and selectors keep their keys.
 ~/.config/mc-admin-tui/kits.json               custom kits
 ~/.cache/mc-admin-tui/items.json               cached item catalogue
 ~/minecraft-backups/<container>/               world backups (tar.gz)
+~/minecraft-maps/<container>/<world>/          rendered uNmINeD web maps
 ```
 
 Locations are namespaced per container, so `Home` for one server does not collide

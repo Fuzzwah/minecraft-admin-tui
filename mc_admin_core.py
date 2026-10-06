@@ -1,25 +1,103 @@
 from __future__ import annotations
 
 import gzip
+import http.server
 import io
+import ipaddress
 import json
 import re
 import shutil
+import socket
 import subprocess
 import tarfile
+import tempfile
+import threading
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from functools import partial
+from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
+from urllib.parse import quote
 
 APP_DIR = Path.home() / ".config" / "mc-admin-tui"
 CACHE_DIR = Path.home() / ".cache" / "mc-admin-tui"
 BACKUP_DIR = Path.home() / "minecraft-backups"
+
+MAP_DIR = Path.home() / "minecraft-maps"
+
 DEFAULT_ITEM_CACHE = CACHE_DIR / "items.json"
 DEFAULT_LOCATIONS = APP_DIR / "locations.json"
 LEGACY_LOCATIONS = APP_DIR / "locations.legacy.json"
 DEFAULT_SERVERS = APP_DIR / "servers.json"
 DEFAULT_KITS = APP_DIR / "kits.json"
+
+MAP_HTTP_PORT = 8765
+MAP_LAN_NETWORK = ipaddress.ip_network("10.1.1.0/24")
+_map_http_lock = threading.Lock()
+_map_http_server: http.server.ThreadingHTTPServer | None = None
+_map_http_address: str | None = None
+
+
+class _MapRequestHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, _format: str, *_args: object) -> None:
+        pass
+
+
+def _map_lan_address() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("10.1.1.1", 9))
+            address = ipaddress.ip_address(probe.getsockname()[0])
+    except OSError as exc:
+        raise RuntimeError(f"Cannot find a route to the 10.1.1 LAN: {exc}") from None
+    if address not in MAP_LAN_NETWORK:
+        raise RuntimeError(
+            f"No host address found on {MAP_LAN_NETWORK}; cannot publish this map "
+            "on the 10.1.1 LAN."
+        )
+    return str(address)
+
+
+def serve_unmined_map(index: Path) -> str:
+    """Serve generated maps read-only on the 10.1.1 LAN and return this map's URL."""
+    map_root = MAP_DIR.resolve()
+    index = index.resolve()
+    if (
+        index.name != "unmined.index.html"
+        or not index.is_file()
+        or not index.is_relative_to(map_root)
+    ):
+        raise ValueError("Map index must be inside the managed map directory.")
+
+    address = _map_lan_address()
+    global _map_http_server, _map_http_address
+    with _map_http_lock:
+        if _map_http_server is None:
+            handler = partial(_MapRequestHandler, directory=str(map_root))
+            try:
+                server = http.server.ThreadingHTTPServer(
+                    (address, MAP_HTTP_PORT), handler
+                )
+            except OSError as exc:
+                raise RuntimeError(
+                    f"Cannot start map server on {address}:{MAP_HTTP_PORT}: {exc}"
+                ) from None
+            server.daemon_threads = True
+            thread = threading.Thread(
+                target=server.serve_forever, name="mc-admin-map-http", daemon=True
+            )
+            thread.start()
+            _map_http_server = server
+            _map_http_address = address
+        elif _map_http_address != address:
+            raise RuntimeError(
+                f"Map server is already bound to {_map_http_address}; restart the TUI "
+                f"to use {address}."
+            )
+
+    relative = index.relative_to(map_root).as_posix()
+    return f"http://{address}:{MAP_HTTP_PORT}/{quote(relative, safe='/')}"
+
 
 BUILTIN_KITS: dict[str, tuple[tuple[str, int], ...]] = {
     "starter": (
@@ -1657,3 +1735,81 @@ def list_backups(container: str, base: Path = BACKUP_DIR) -> list[Path]:
         return []
     # Names carry a sortable UTC timestamp, so newest-first is name-descending.
     return sorted(directory.glob("*.tar.gz"), reverse=True)
+
+
+def default_map_dir(container: str, level_name: str, base: Path = MAP_DIR) -> Path:
+    return base / safe_filename(container) / safe_filename(level_name)
+
+
+def create_unmined_map(
+    server: ServerConfig,
+    *,
+    level_name: str = "world",
+    on_progress: Callable[[str], None] | None = None,
+    timeout: int = 3600,
+) -> Path:
+    """Render/update a local uNmINeD web map from a streamed server world snapshot."""
+    cli = shutil.which("unmined-cli")
+    if cli is None:
+        raise RuntimeError("uNmINeD CLI not found; install it and ensure `unmined-cli` is on PATH.")
+    if not level_name or level_name in {".", ".."} or "/" in level_name or "\\" in level_name:
+        raise ValueError("Invalid world folder name.")
+
+    log = on_progress or (lambda _message: None)
+    destination = default_map_dir(server.container, level_name)
+    destination.mkdir(parents=True, exist_ok=True)
+    source = f"/data/{level_name}"
+    log(f"Copying {source} from {server.container} for map rendering …")
+
+    with tempfile.TemporaryDirectory(prefix="mc-admin-map-") as temporary:
+        snapshot_root = Path(temporary)
+        world_dir = snapshot_root / level_name
+        argv = [runtime_binary(server.runtime), "cp", f"{server.container}:{source}", "-"]
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert proc.stdout is not None
+        try:
+            with tarfile.open(fileobj=proc.stdout, mode="r|*") as archive:
+                for member in archive:
+                    relative = PurePosixPath(member.name)
+                    if relative.is_absolute() or not relative.parts or any(
+                        part in {"", ".", ".."} for part in relative.parts
+                    ):
+                        raise RuntimeError("Container returned an unsafe world archive path.")
+                    target = snapshot_root.joinpath(*relative.parts)
+                    if not target.resolve().is_relative_to(snapshot_root.resolve()):
+                        raise RuntimeError("Container returned an unsafe world archive path.")
+                    if member.isdir():
+                        target.mkdir(parents=True, exist_ok=True)
+                    elif member.isfile() and not member.issparse():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        source_file = archive.extractfile(member)
+                        if source_file is None:
+                            raise RuntimeError("Cannot read a world file from the container archive.")
+                        with source_file, target.open("wb") as output:
+                            shutil.copyfileobj(source_file, output)
+                    else:
+                        raise RuntimeError("Container world archive contains a link or special file.")
+            _, stderr = proc.communicate(timeout=timeout)
+        except Exception:
+            proc.kill()
+            proc.communicate()
+            raise
+        if proc.returncode:
+            detail = (stderr or b"").decode("utf-8", "replace").strip()
+            raise RuntimeError(detail or f"{server.runtime} cp exited {proc.returncode}")
+
+        log(f"Rendering web map to {destination} …")
+        result = subprocess.run(
+            [cli, "web", "render", f"--world={world_dir}", f"--output={destination}"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip()
+            raise RuntimeError(detail or f"uNmINeD exited {result.returncode}")
+    index = destination / "unmined.index.html"
+    if not index.is_file():
+        raise RuntimeError(f"uNmINeD did not create {index}")
+    log(f"Map ready: {index}")
+    return index
