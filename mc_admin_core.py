@@ -33,6 +33,7 @@ DEFAULT_KITS = APP_DIR / "kits.json"
 
 MAP_HTTP_PORT = 8765
 MAP_LAN_NETWORK = ipaddress.ip_network("10.1.1.0/24")
+_MAP_INDEX_NAMES = ("unmined.index.html", "index.html")
 _map_http_lock = threading.Lock()
 _map_http_server: http.server.ThreadingHTTPServer | None = None
 _map_http_address: str | None = None
@@ -63,7 +64,7 @@ def serve_unmined_map(index: Path) -> str:
     map_root = MAP_DIR.resolve()
     index = index.resolve()
     if (
-        index.name != "unmined.index.html"
+        index.name not in _MAP_INDEX_NAMES
         or not index.is_file()
         or not index.is_relative_to(map_root)
     ):
@@ -1745,6 +1746,7 @@ def create_unmined_map(
     server: ServerConfig,
     *,
     level_name: str = "world",
+    java_client_jar: Path | None = None,
     on_progress: Callable[[str], None] | None = None,
     timeout: int = 3600,
 ) -> Path:
@@ -1799,8 +1801,23 @@ def create_unmined_map(
             raise RuntimeError(detail or f"{server.runtime} cp exited {proc.returncode}")
 
         log(f"Rendering web map to {destination} …")
+        render_args = [
+            cli,
+            "web",
+            "render",
+            "--imageformat=png",
+            "--dimension=overworld",
+        ]
+        if java_client_jar is not None:
+            java_client_jar = java_client_jar.expanduser()
+            if not java_client_jar.is_file():
+                raise RuntimeError(f"Minecraft client JAR not found: {java_client_jar}")
+            render_args.extend(
+                (f"--java-client-jar={java_client_jar}", "--force")
+            )
+        render_args.extend((f"--world={world_dir}", f"--output={destination}"))
         result = subprocess.run(
-            [cli, "web", "render", f"--world={world_dir}", f"--output={destination}"],
+            render_args,
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -1808,8 +1825,12 @@ def create_unmined_map(
         if result.returncode:
             detail = (result.stderr or result.stdout).strip()
             raise RuntimeError(detail or f"uNmINeD exited {result.returncode}")
-    index = destination / "unmined.index.html"
-    if not index.is_file():
-        raise RuntimeError(f"uNmINeD did not create {index}")
+    index = next(
+        (destination / name for name in _MAP_INDEX_NAMES if (destination / name).is_file()),
+        None,
+    )
+    if index is None:
+        expected = ", ".join(str(destination / name) for name in _MAP_INDEX_NAMES)
+        raise RuntimeError(f"uNmINeD did not create a map entrypoint ({expected})")
     log(f"Map ready: {index}")
     return index

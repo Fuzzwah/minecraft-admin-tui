@@ -210,7 +210,8 @@ retrying, since the copy may have partially completed.
 
 In the **Backups** modal, choose a discovered world and select **Create uNmINeD
 map**. The TUI runs `save-all`, streams that world out of the container to a
-temporary local copy, then runs `unmined-cli web render`. The map is written under
+temporary local copy, then runs `unmined-cli web render` for the world's
+Overworld dimension. The map is written under
 `~/minecraft-maps/<container>/<world>/`. After rendering, the TUI starts a read-only
 HTTP server and displays a LAN URL for the map. It binds to the host's detected
 `10.1.1.0/24` address on TCP port `8765`; keep the TUI running while other machines
@@ -218,6 +219,18 @@ view it. Allow that port through the host firewall if needed. The server has no
 authentication: anyone who can reach it can read all maps under
 `~/minecraft-maps/`. Temporary world files are removed after rendering; this does
 not create a backup archive.
+
+For detailed Java block colors, supply a matching Minecraft **client** JAR when
+starting the TUI:
+
+```bash
+python mc_admin_tui.py \
+  --unmined-client-jar ~/.minecraft/versions/26.3/26.3.jar
+```
+
+The client JAR enables uNmINeD's Java datapack and block-color processing. A
+server JAR from the container is not a substitute. Without this option,
+uNmINeD falls back to its built-in styles and logs that datapacks were skipped.
 
 ### Activity / Fun
 
@@ -380,6 +393,8 @@ Full option list: `mc-admin-tui --help`.
   field of that tab (e.g. `g`, `Tab` → the item search box)
 - `b` / `Ctrl+B` / `⌥B` — open the Backups modal (`Esc` closes)
 - `Ctrl+O` — open Settings; `Esc` closes, with confirmation for unsaved edits
+- `Tab` / `Shift+Tab` — move forward/backward through modal controls, including
+  the Backups action buttons
 - `Alt+R` — rescan the host for servers
 - `Ctrl+R` — refresh online players
 - `q` — quit when the focused widget isn't consuming the key

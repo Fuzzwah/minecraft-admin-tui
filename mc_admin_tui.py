@@ -148,9 +148,12 @@ class BackupScreen(ModalScreen[None]):
 
     BINDINGS = [("escape", "close", "Close")]
 
-    def __init__(self, server: ServerConfig) -> None:
+    def __init__(
+        self, server: ServerConfig, unmined_client_jar: Path | None = None
+    ) -> None:
         super().__init__()
         self.server = server
+        self.unmined_client_jar = unmined_client_jar
         self.worlds: list[str] = []
 
     def compose(self) -> ComposeResult:
@@ -279,6 +282,7 @@ class BackupScreen(ModalScreen[None]):
             index = create_unmined_map(
                 self.server,
                 level_name=world,
+                java_client_jar=self.unmined_client_jar,
                 on_progress=lambda message: self.app.call_from_thread(self._log, message),
             )
         except Exception as exc:
@@ -1080,9 +1084,15 @@ class MinecraftAdminApp(App[None]):
         ("q", "quit", "Quit"),
     ]
 
-    def __init__(self, config: ServerConfig | None) -> None:
+    def __init__(
+        self,
+        config: ServerConfig | None,
+        *,
+        unmined_client_jar: Path | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
+        self.unmined_client_jar = unmined_client_jar
         self.discovered: list[DiscoveredServer] = []
         self.preferred = (
             config or load_last_server() or (load_server_configs() or [None])[0]
@@ -1102,9 +1112,10 @@ class MinecraftAdminApp(App[None]):
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         # App priority bindings are considered before modal widget bindings.
-        # Suppress the entire app namespace so editors and Selects keep their keys.
+        # Keep modal editors and Selects' keys, but preserve Textual's built-in
+        # focus traversal so Tab and Shift+Tab still move between modal controls.
         if isinstance(self.screen, ModalScreen):
-            return False
+            return action in {"focus_next", "focus_previous"}
         return super().check_action(action, parameters)
 
     def compose(self) -> ComposeResult:
@@ -1649,7 +1660,7 @@ class MinecraftAdminApp(App[None]):
         if self.config is None:
             self.notify("Select a server first", severity="warning")
             return
-        self.push_screen(BackupScreen(self.config))
+        self.push_screen(BackupScreen(self.config, self.unmined_client_jar))
 
     @on(Button.Pressed, "#open-backups")
     def open_backups_pressed(self) -> None:
@@ -2478,6 +2489,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Minecraft generated reports/registries.json; imported and cached.",
     )
+    parser.add_argument(
+        "--unmined-client-jar",
+        type=Path,
+        help="Minecraft Java client JAR for detailed uNmINeD map colors.",
+    )
     return parser.parse_args()
 
 
@@ -2533,7 +2549,11 @@ def config_from_args(args: argparse.Namespace) -> ServerConfig | None:
 
 
 def main() -> None:
-    MinecraftAdminApp(config_from_args(parse_args())).run()
+    args = parse_args()
+    MinecraftAdminApp(
+        config_from_args(args),
+        unmined_client_jar=args.unmined_client_jar,
+    ).run()
 
 
 if __name__ == "__main__":
