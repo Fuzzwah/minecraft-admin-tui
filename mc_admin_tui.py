@@ -42,6 +42,8 @@ from mc_admin_core import (
     all_kits,
     available_runtimes,
     backup_world,
+    create_unmined_map,
+    serve_unmined_map,
     container_level_name,
     container_status,
     default_backup_dir,
@@ -173,6 +175,13 @@ class BackupScreen(ModalScreen[None]):
                     id="backup-keep",
                 )
                 yield Button("Back up world", id="backup-run", variant="primary")
+            with Horizontal(id="backup-map-row"):
+                yield Button("Create uNmINeD map", id="backup-map", variant="primary")
+                yield Static(
+                    "LAN URL appears after map creation",
+                    id="backup-map-url",
+                    classes="help",
+                )
             with Horizontal(id="backup-list-row"):
                 yield Select(
                     [], prompt="No backups yet", allow_blank=True, id="backup-existing"
@@ -250,6 +259,59 @@ class BackupScreen(ModalScreen[None]):
         label = self.query_one("#backup-label", Input).value.strip()
         keep = int(str(self.query_one("#backup-keep", Select).value))
         self.backup_worker(world, label, keep)
+
+    @on(Button.Pressed, "#backup-map")
+    def run_map(self) -> None:
+        world = self.query_one("#backup-world", Select).value
+        if not isinstance(world, str) or not world:
+            self.notify("Choose a world to map", severity="warning")
+            return
+        self.map_worker(world)
+
+    @work(thread=True, exclusive=True, group="map")
+    def map_worker(self, world: str) -> None:
+        self.app.call_from_thread(self._log, f"[b]uNmINeD map started[/b] ({world})")
+        try:
+            rcon(self.server, "save-all")
+        except Exception as exc:
+            self.app.call_from_thread(self._log, f"[yellow]save-all skipped:[/] {exc}")
+        try:
+            index = create_unmined_map(
+                self.server,
+                level_name=world,
+                on_progress=lambda message: self.app.call_from_thread(self._log, message),
+            )
+        except Exception as exc:
+            self.app.call_from_thread(self._map_finished, None, None, str(exc))
+            return
+        try:
+            url = serve_unmined_map(index)
+        except Exception as exc:
+            self.app.call_from_thread(self._map_finished, index, None, str(exc))
+        else:
+            self.app.call_from_thread(self._map_finished, index, url, None)
+
+    def _map_finished(
+        self, index: Path | None, url: str | None, error: str | None
+    ) -> None:
+        if index is None:
+            self._log(f"[red]Map creation failed:[/] {error}")
+            self.notify("Map creation failed", severity="error")
+            return
+        if error:
+            self._log(
+                f"[yellow]Map saved locally at [b]{index}[/b], but LAN hosting failed:[/] {error}"
+            )
+            self.query_one("#backup-map-url", Static).update(
+                "LAN hosting failed; see log"
+            )
+            self.notify("Map created locally; LAN hosting failed", severity="warning")
+            return
+        assert url is not None
+        self.query_one("#backup-map-url", Static).update(url)
+        self._log(f"[green]✓[/] LAN map: [b]{url}[/b]")
+        self.notify(f"Map available at {url}")
+
 
     @work(thread=True, exclusive=True, group="backup")
     def backup_worker(self, world: str, label: str, keep: int) -> None:
@@ -876,7 +938,7 @@ class MinecraftAdminApp(App[None]):
     }
 
     #give-row, #coords-row, #location-row, #raw-row, #restart-row, #stop-row,
-    #backup-row, #backup-list-row, #kit-row, #kit-save-row {
+    #backup-row, #backup-map-row, #backup-list-row, #kit-row, #kit-save-row {
         height: auto;
         margin-top: 1;
     }
