@@ -146,13 +146,13 @@ class HubWorldTests(unittest.TestCase):
     def test_rebuild_preserves_community_submission_containers(self):
         fresh = world.build_commands([])
         rebuilt = world.build_commands([], preserve_submissions=True)
-        for commands in (fresh, rebuilt):
-            self.assertIn("setblock 20 64 156 minecraft:chest[facing=south]" +
-                          (" keep" if commands is rebuilt else ""), commands)
-            self.assertIn("setblock 80 64 156 minecraft:chest[facing=south]" +
-                          (" keep" if commands is rebuilt else ""), commands)
+        self.assertIn("setblock 20 64 156 minecraft:chest[facing=south]", fresh)
+        self.assertIn("setblock 80 64 156 minecraft:chest[facing=south]", fresh)
         self.assertTrue(any(command.startswith("data merge block 20 64 156") for command in fresh))
-        self.assertFalse(any(command.startswith("data merge block 20 64 156") for command in rebuilt))
+        self.assertIn("execute unless block 20 64 156 minecraft:chest run setblock 20 64 156 minecraft:chest[facing=south]", rebuilt)
+        self.assertIn("execute unless block 80 64 156 minecraft:chest run setblock 80 64 156 minecraft:chest[facing=south]", rebuilt)
+        self.assertTrue(any(command.startswith("execute unless data block 20 64 156 Items[0]")
+                            for command in rebuilt))
 
     def test_spawn_floor_and_every_fill_fit_default_modification_limit(self):
         commands = world.build_commands([{"id": 128, "name": "last"}])

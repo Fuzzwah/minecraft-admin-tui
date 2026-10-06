@@ -153,17 +153,23 @@ def community_commands(*, preserve_submissions: bool = False) -> list[str]:
                         color="gold"),
         _community_sign(96, 64, 154, ["SHOWCASE", "Community", "Achievements", "Admin managed"],
                         color="dark_aqua"),
-        "setblock 20 64 156 minecraft:chest[facing=south]"
-        + (" keep" if preserve_submissions else ""),
-        "setblock 80 64 156 minecraft:chest[facing=south]"
-        + (" keep" if preserve_submissions else ""),
     ]
-    if not preserve_submissions:
-        commands.append(
-            "data merge block 20 64 156 "
-            '{Items:[{slot:0,id:"minecraft:oak_sign",count:16,'
-            'components:{"minecraft:can_place_on":{"blocks":["minecraft:polished_blackstone"]}}}]}'
-        )
+    sign_items = (
+        '{Items:[{slot:0,id:"minecraft:oak_sign",count:16,'
+        'components:{"minecraft:can_place_on":{"blocks":["minecraft:polished_blackstone"]}}}]}'
+    )
+    if preserve_submissions:
+        commands.extend([
+            "execute unless block 20 64 156 minecraft:chest run setblock 20 64 156 minecraft:chest[facing=south]",
+            "execute unless block 80 64 156 minecraft:chest run setblock 80 64 156 minecraft:chest[facing=south]",
+            "execute unless data block 20 64 156 Items[0] run data merge block 20 64 156 " + sign_items,
+        ])
+    else:
+        commands.extend([
+            "setblock 20 64 156 minecraft:chest[facing=south]",
+            "setblock 80 64 156 minecraft:chest[facing=south]",
+            "data merge block 20 64 156 " + sign_items,
+        ])
     return commands
 
 
