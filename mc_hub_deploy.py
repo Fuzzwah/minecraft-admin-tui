@@ -225,6 +225,7 @@ def deploy(args) -> None:
         config = {"hub": {"container": args.container, "rcon_host": "127.0.0.1", "rcon_port": args.rcon_port,
                           "rcon_password": secrets.token_urlsafe(32), "game_port": args.port},
                   "address": args.address, "admins": [admin["uuid"] for admin in admins], "targets": {},
+                  "features": {"community_messages": True},
                   "poll_seconds": 1, "scan_seconds": 10}
         state = {"slots": {}, "generated": []}
         volume = args.container + "_data"
@@ -256,6 +257,10 @@ def deploy(args) -> None:
             "server.properties": "".join(f"{key}={value}\n" for key, value in properties.items()),
         })
         private_json(config_path, config)
+    features = config.get("features", {})
+    if not isinstance(features, dict) or type(features.get("community_messages", True)) is not bool:
+        raise ValueError("features.community_messages must be a boolean")
+    community_messages = features.get("community_messages", True)
     inventory = list_containers("podman")
     for item in sorted(inventory, key=container_name):
         name = container_name(item)
@@ -279,7 +284,8 @@ def deploy(args) -> None:
         slots = [{"id": identifier, "name": name} for name, identifier in sorted(state["slots"].items(), key=lambda pair: pair[1])]
         install_datapack(args.container, datapack_files(slots))
         checked_command(client, "reload")
-        commands = build_commands(slots)
+        commands = build_commands(slots, community_messages=community_messages,
+                                  preserve_submissions=args.rebuild)
         checked_command(client, commands[0])
         wait_for_chunks(client, FORCELOAD_BOUNDS)
         for command in commands[1:]:

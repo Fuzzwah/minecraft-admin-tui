@@ -274,8 +274,25 @@ using the hub.
   status/control signs are waxed and rewritten by the controller.
 - Whitelisted visitors can browse and join ready destinations but cannot start
   or stop them. Add visitors using the hub's normal Minecraft whitelist commands.
+- The generated hub includes a protected community commons outside the destination
+  bays. Visitors can take signs from the supply chest and place them only on the
+  polished-blackstone message wall; ordinary Adventure-mode protection remains
+  active elsewhere. Notes are plain display text and never execute commands.
+- A separate suggestions chest is available for written books, while the notice
+  board and showcase signs remain administrator-managed. Explicit `--rebuild`
+  preserves the sign and suggestion containers instead of clearing their contents.
 
 ### Configuration and operations
+
+The community commons is enabled by default. To disable its generation for a
+new deployment or explicit rebuild, add this to `~/.config/mc-admin-tui/hub.json`:
+
+```json
+"features": {"community_messages": false}
+```
+
+Disabling the feature prevents new managed community geometry from being emitted;
+it does not delete an existing commons or its player content.
 
 Private configuration: `~/.config/mc-admin-tui/hub.json`.
 Stable bay mapping: `~/.local/share/mc-admin-tui/hub-state.json`.
