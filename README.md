@@ -215,6 +215,99 @@ retrying, since the copy may have partially completed.
 The lightning button is intentionally labelled as dangerous because it can hurt the
 selected player.
 
+## Generated hub world (Minecraft 26.3)
+
+`mc_hub_world.py`, `mc_hub.py`, and `mc_hub_deploy.py` provide a generated
+**vanilla Java 26.3** selection/control hub. The hub discovers Podman Minecraft
+containers, including stopped containers; Docker is not supported by this controller.
+Each destination gets a stable portal bay with its container name, live status,
+player count, readiness lamp, Start/Stop signs, and an editable owner-label sign.
+Discovery is limited to 128 stable bay IDs. Removed destinations remain visible as
+Missing; IDs are not reassigned to unrelated containers.
+
+### Deploy
+
+Run as the host user that owns the Podman containers, from this checkout:
+
+```bash
+python3 -m mc_hub_deploy \
+  --address 10.1.1.232 --bind-address 10.1.1.232 --port 25565 \
+  --admin YOUR_AUTHENTICATED_UUID:YourPlayerName
+```
+
+Use your own player-reachable address and authenticated Minecraft UUID/name.
+Deployment creates an isolated `mc_hub` container and `mc_hub_data` volume, pins
+vanilla Minecraft to `26.3`, publishes RCON only on `127.0.0.1:25579`, and enables
+`mc-hub-controller.service` as a systemd user service. The initial whitelist contains
+the administrators supplied through repeatable `--admin` options.
+
+The hub's default game port is `25565`, so players can join by hostname/IP
+without a port suffix. Destinations must use distinct published game ports:
+for example, `mc_do_not_die` on `25569`, Hardcore on `25567`, and AI Director
+on `25555`. Changing a published port requires recreating that container with
+the same data volume; it does not require rebuilding or moving the world.
+
+The controller starts the hub in its main process and waits for RCON readiness.
+It deliberately avoids `ExecStartPre=podman start`: systemd kills that command's
+children, including rootless Podman's network forwarder. Restarting or stopping
+the controller preserves container networking and does not stop the hub container.
+Generated blocks are flushed to disk before their bay mapping is marked complete,
+including when an empty vanilla server pauses before its normal autosave.
+
+Existing destinations are **not restarted** during deployment. `--rebuild` explicitly
+regenerates managed geometry while preserving existing owner-label signs;
+`--no-service` leaves controller startup to you. Do not rebuild while people are
+using the hub.
+
+### In-world controls
+
+- Join with a Java **26.3** client. Walk into an arch to request a transfer. A running
+  container is not necessarily joinable; its status sign and controller status
+  report destination requirements.
+- Start/Stop requires both an authenticated administrator UUID in the configuration
+  and `"control": true` for the destination. Stop requires a second click within
+  ten seconds and refuses occupied servers. Stops use the container's graceful
+  shutdown period. The hub itself cannot be stopped through a bay.
+- Stand by the owner-label pedestal as an administrator to edit its unwaxed oak
+  sign. The datapack temporarily permits survival-mode sign editing there while
+  disabling block breaking; elsewhere players remain in Adventure mode. Managed
+  status/control signs are waxed and rewritten by the controller.
+- Whitelisted visitors can browse and join ready destinations but cannot start
+  or stop them. Add visitors using the hub's normal Minecraft whitelist commands.
+
+### Configuration and operations
+
+Private configuration: `~/.config/mc-admin-tui/hub.json`.
+Stable bay mapping: `~/.local/share/mc-admin-tui/hub-state.json`.
+Treat the configuration as a secret: it contains the hub's RCON password.
+Back up the hub volume and mapping together.
+
+Deployment initially enrolls eligible vanilla 26.3 destinations whose server
+properties are not overwritten at startup, excluding names containing `test` or
+`rollback`. Subsequently discovered containers are displayed but remain view-only
+until explicitly enrolled in `targets`. Review this policy before admitting users.
+For a destination entry, `"control": true` enables lifecycle controls; optional
+`"address"` and `"port"` override the player-reachable transfer endpoint. Restart
+the controller after editing the configuration.
+
+```bash
+python3 -m mc_hub status
+systemctl --user restart mc-hub-controller.service
+journalctl --user -u mc-hub-controller.service -n 50 --no-pager
+```
+
+Transfer destinations must actually run vanilla 26.3 with `online-mode=true`,
+RCON enabled, `accepts-transfers=true`, and a game port reachable from the player's
+computer. Starting a stopped enrolled destination enables incoming transfers
+before launch. An already running destination with transfers disabled is left
+unchanged; enable transfers during a planned stop/start, not while players are
+online. Conflicting published ports prevent a start.
+
+Minecraft receives neither a Podman socket nor host command access. The host-side
+controller authenticates live player UUIDs and accepts only fixed join/start/stop
+requests. This is vanilla `/transfer`, not a proxy: destinations do not
+automatically return players to the hub when they stop.
+
 ## Install
 
 ```bash
