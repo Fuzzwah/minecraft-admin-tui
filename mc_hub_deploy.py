@@ -162,6 +162,24 @@ def checked_command(client, command: str) -> str:
     return result
 
 
+def refresh_datapack(config: dict):
+    """Refresh the installed hub pack using fresh RCON sessions.
+
+    Vanilla 26.3 does not expose the legacy ``reload`` command. Disabling and
+    re-enabling the file pack also avoids reusing an RCON stream across the
+    datapack lifecycle transition.
+    """
+    from mc_hub import RconClient
+    quote = chr(34)
+    for action in ("disable", "enable"):
+        client = RconClient(config["rcon_host"], config["rcon_port"], config["rcon_password"])
+        try:
+            checked_command(client, f"datapack {action} {quote}file/hub{quote}")
+        finally:
+            client.close()
+    return wait_for_hub(config)
+
+
 def wait_for_chunks(client, bounds: tuple[int, int, int, int], timeout: int = 180) -> None:
     pending = {(x, z) for x in range(bounds[0], bounds[2] + 1, 16)
                for z in range(bounds[1], bounds[3] + 1, 16)}
@@ -283,7 +301,8 @@ def deploy(args) -> None:
     try:
         slots = [{"id": identifier, "name": name} for name, identifier in sorted(state["slots"].items(), key=lambda pair: pair[1])]
         install_datapack(args.container, datapack_files(slots))
-        checked_command(client, "reload")
+        client.close()
+        client = refresh_datapack(config["hub"])
         commands = build_commands(slots, community_messages=community_messages,
                                   preserve_submissions=args.rebuild)
         checked_command(client, commands[0])
