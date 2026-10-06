@@ -123,7 +123,7 @@ class HubWorldTests(unittest.TestCase):
             for generate in (world.build_commands, world.datapack_files):
                 with self.assertRaises(ValueError):
                     generate(slots)
-        self.assertEqual(world.build_commands([])[0], "forceload add 0 0 255 191")
+        self.assertEqual(world.build_commands([])[0], "forceload add 0 0 255 175")
 
     def test_community_area_has_sign_supply_wall_and_moderated_channels(self):
         commands = world.build_commands([])

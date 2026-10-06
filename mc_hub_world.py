@@ -23,8 +23,8 @@ from collections.abc import Iterable, Mapping
 MAX_SLOTS = 128
 DATA_PACK_FORMAT = 121
 SPAWN = (8, 64, 8)
-FORCELOAD_BOUNDS = (0, 0, 255, 191)
-COMMUNITY_BOUNDS = (16, 152, 112, 175)
+FORCELOAD_BOUNDS = (0, 0, 255, 175)
+COMMUNITY_BOUNDS = (16, 152, 112, 174)
 
 
 def _json(value: object) -> str:
@@ -136,7 +136,7 @@ def community_commands(*, preserve_submissions: bool = False) -> list[str]:
         f"fill 15 64 {z1} 15 67 {z2} minecraft:barrier",
         f"fill 113 64 {z1} 113 67 {z2} minecraft:barrier",
         f"fill 16 64 151 112 67 151 minecraft:barrier",
-        f"fill 16 64 176 112 67 176 minecraft:barrier",
+        f"fill 16 64 175 112 67 175 minecraft:barrier",
         # Open a single managed connector through the former north boundary.
         "fill 120 64 143 135 67 143 minecraft:air",
         # Polished blackstone is reserved for the only visitor-editable sign wall.
@@ -252,7 +252,8 @@ def build_commands(slots: Iterable[Mapping[str, object]], *,
         raise ValueError("community feature flags must be booleans")
     ordered = _slots(slots)
     commands = [f"forceload add {FORCELOAD_BOUNDS[0]} {FORCELOAD_BOUNDS[1]} "
-                f"{FORCELOAD_BOUNDS[2]} {FORCELOAD_BOUNDS[3]}"]
+                f"{FORCELOAD_BOUNDS[2]} {FORCELOAD_BOUNDS[3]}",
+                "forceload remove 0 176 255 191"]
     # Nine separate fills stay below the default max_block_modifications=32768.
     for z in range(0, 144, 16):
         commands.append(f"fill 0 63 {z} 255 63 {z + 15} minecraft:stone_bricks")
