@@ -237,6 +237,8 @@ uNmINeD falls back to its built-in styles and logs that datapacks were skipped.
 - in-app audit trail for admin actions
 - totem particles, note-block ding, glowing effect, BONK title, summon a chicken,
   lightning strike
+- BONK displays a bold gold title on the selected player; JSON command payloads
+  are preserved when substituting the player target.
 
 The lightning button is intentionally labelled as dangerous because it can hurt the
 selected player.
