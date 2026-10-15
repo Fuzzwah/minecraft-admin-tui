@@ -1760,7 +1760,7 @@ class MinecraftAdminApp(App[None]):
         player = self._require_player()
         if not player:
             return
-        self.run_rcon_action(label, command.format(player=player), refresh)
+        self.run_rcon_action(label, command.replace("{player}", player), refresh)
 
     @work(thread=True)
     def run_rcon_action(self, label: str, command: str, refresh: bool = False) -> None:
