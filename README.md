@@ -136,6 +136,9 @@ retrying, since the copy may have partially completed.
 
 - fuzzy item search / autocomplete
 - aliases such as `fireworks`, `wither skull`, and `deep slate`
+- enchanted books for all 43 vanilla Java enchantments, at every normal level
+  (128 variants), including treasure enchantments and both curses; search by name,
+  e.g. `mending`, `sharpness V` / `sharpness 5`, or `curse of binding`
 - quantity control
 - exact Minecraft item IDs
 - optional generated-registry support (see below)
@@ -435,6 +438,13 @@ Resolution order for the catalogue:
 2. `~/.cache/mc-admin-tui/items.json` — a previously imported/cached catalogue
 3. the bundled `registries.json`
 4. a small built-in starter list (only if none of the above load)
+
+Every catalogue source is supplemented with enchanted book variants through Java
+1.21.11 (including Lunge), matching the bundled baseline. These use
+`minecraft:stored_enchantments` item components, so Give produces a book with the
+selected enchantment and level rather than an empty enchanted book. Existing item
+caches need no refresh. The enchantment list and normal level caps follow the
+[vanilla enchantment list](https://minecraft.wiki/w/Enchantment#List_of_enchantments).
 
 To refresh the baseline against the exact version you run, generate Mojang's
 `registries.json` with the matching server jar:

@@ -248,6 +248,66 @@ FALLBACK_ITEMS = [
     "minecraft:dirt",
 ]
 
+# Vanilla Java enchantments through 1.21.11, matching the bundled item registry.
+# Registry reports list item IDs, not the stored-enchantment variants of books.
+_ENCHANTMENT_MAX_LEVELS = {
+    "aqua_affinity": 1,
+    "bane_of_arthropods": 5,
+    "binding_curse": 1,
+    "blast_protection": 4,
+    "breach": 4,
+    "channeling": 1,
+    "density": 5,
+    "depth_strider": 3,
+    "efficiency": 5,
+    "feather_falling": 4,
+    "fire_aspect": 2,
+    "fire_protection": 4,
+    "flame": 1,
+    "fortune": 3,
+    "frost_walker": 2,
+    "impaling": 5,
+    "infinity": 1,
+    "knockback": 2,
+    "looting": 3,
+    "loyalty": 3,
+    "luck_of_the_sea": 3,
+    "lunge": 3,
+    "lure": 3,
+    "mending": 1,
+    "multishot": 1,
+    "piercing": 4,
+    "power": 5,
+    "projectile_protection": 4,
+    "protection": 4,
+    "punch": 2,
+    "quick_charge": 3,
+    "respiration": 3,
+    "riptide": 3,
+    "sharpness": 5,
+    "silk_touch": 1,
+    "smite": 5,
+    "soul_speed": 3,
+    "sweeping_edge": 3,
+    "swift_sneak": 3,
+    "thorns": 3,
+    "unbreaking": 3,
+    "vanishing_curse": 1,
+    "wind_burst": 3,
+}
+_ROMAN_LEVELS = ("I", "II", "III", "IV", "V")
+_ENCHANTED_BOOKS = {
+    f'minecraft:enchanted_book[minecraft:stored_enchantments={{"minecraft:{enchantment}":{level}}}]':
+    "enchanted book — "
+    + {
+        "binding_curse": "curse of binding",
+        "vanishing_curse": "curse of vanishing",
+    }.get(enchantment, enchantment.replace("_", " "))
+    + f" {_ROMAN_LEVELS[level - 1]}"
+    for enchantment, max_level in _ENCHANTMENT_MAX_LEVELS.items()
+    for level in range(1, max_level + 1)
+}
+
 ITEM_ALIASES: dict[str, tuple[str, ...]] = {
     "minecraft:firework_rocket": ("fireworks", "firework", "rocket", "elytra rocket"),
     "minecraft:wither_skeleton_skull": ("wither skull", "wither skeleton head"),
@@ -833,6 +893,8 @@ def human_size(count: int | None) -> str:
 
 def human_name(item_id: str) -> str:
     """Readable label for an item id, tolerating component suffixes like [enchantments=…]."""
+    if item_id in _ENCHANTED_BOOKS:
+        return _ENCHANTED_BOOKS[item_id]
     base, _, components = item_id.partition("[")
     namespace, _, path = base.partition(":")
     words = path.replace("_", " ").replace("/", " / ")
@@ -857,6 +919,8 @@ def score_item(query: str, item_id: str) -> tuple[int, int, int, str] | None:
     name = search_key(item_path)
     aliases = tuple(search_key(alias) for alias in ITEM_ALIASES.get(item_id, ()))
     searchable = (name, *aliases)
+    if item_id in _ENCHANTED_BOOKS:
+        searchable += (search_key(_ENCHANTED_BOOKS[item_id]),)
 
     for candidate_index, candidate in enumerate(searchable):
         if q == candidate:
@@ -909,6 +973,12 @@ def _bundled_registry() -> Path | None:
 
 
 def load_items(registry: Path | None) -> tuple[list[str], str]:
+    """Resolve base item IDs and add all vanilla enchanted book levels."""
+    items, source = _load_base_items(registry)
+    return sorted(set(items).union(_ENCHANTED_BOOKS)), source
+
+
+def _load_base_items(registry: Path | None) -> tuple[list[str], str]:
     """Resolve the item catalogue: explicit registry → cache → bundled → fallback."""
     if registry:
         items = items_from_registry(registry)
