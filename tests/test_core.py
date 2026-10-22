@@ -668,6 +668,65 @@ class RegistryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 items_from_registry(path)
 
+    def test_enchanted_books_available_from_every_catalogue_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cache = root / "items.json"
+            registry = root / "registries.json"
+            registry.write_text(json.dumps({
+                "minecraft:item": {"entries": {
+                    "minecraft:diamond": {}, "minecraft:enchanted_book": {},
+                }},
+            }), encoding="utf-8")
+            with patch("mc_admin_core.DEFAULT_ITEM_CACHE", cache):
+                for source in ("explicit", "cache", "bundled", "fallback"):
+                    with self.subTest(source=source):
+                        cache.unlink(missing_ok=True)
+                        if source == "cache":
+                            # Existing caches predate book variants.
+                            cache.write_text(
+                                '["minecraft:diamond", "minecraft:enchanted_book"]',
+                                encoding="utf-8",
+                            )
+                        bundled = None if source == "fallback" else registry
+                        with patch("mc_admin_core._bundled_registry", return_value=bundled):
+                            items, _ = load_items(registry if source == "explicit" else None)
+                        enchantments = {}
+                        for item in items:
+                            if "[minecraft:stored_enchantments=" not in item:
+                                continue
+                            stored = json.loads(item.split("=", 1)[1][:-1])
+                            self.assertEqual(len(stored), 1)
+                            enchantment, level = next(iter(stored.items()))
+                            self.assertIs(type(level), int)
+                            enchantments.setdefault(enchantment, set()).add(level)
+                        self.assertEqual(enchantments["minecraft:sharpness"], {1, 2, 3, 4, 5})
+                        self.assertEqual(enchantments["minecraft:mending"], {1})
+                        self.assertEqual(enchantments["minecraft:binding_curse"], {1})
+                        self.assertEqual(enchantments["minecraft:vanishing_curse"], {1})
+                        self.assertEqual(enchantments["minecraft:wind_burst"], {1, 2, 3})
+                        self.assertEqual(enchantments["minecraft:lunge"], {1, 2, 3})
+                        self.assertIn("minecraft:enchanted_book", items)
+
+    def test_book_search_distinguishes_numeric_and_roman_levels(self):
+        with patch("mc_admin_core.DEFAULT_ITEM_CACHE", Path("/nonexistent/items.json")), \
+             patch("mc_admin_core._bundled_registry", return_value=None):
+            items, _ = load_items(None)
+        for query, enchantment, level in (
+            ("sharpness 5", "sharpness", 5),
+            ("sharpness V", "sharpness", 5),
+            ("book efficiency IV", "efficiency", 4),
+            ("curse of binding", "binding_curse", 1),
+            ("mending", "mending", 1),
+            ("wind burst III", "wind_burst", 3),
+        ):
+            with self.subTest(query=query):
+                item = find_matches(query, items)[0]
+                self.assertEqual(
+                    json.loads(item.split("=", 1)[1][:-1]),
+                    {f"minecraft:{enchantment}": level},
+                )
+
 
 class ContainerLifecycleTests(unittest.TestCase):
     def test_managed_image_without_required_options_cannot_start_or_restart(self):

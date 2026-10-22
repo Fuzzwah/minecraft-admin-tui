@@ -1167,7 +1167,7 @@ class MinecraftAdminApp(App[None]):
                 with TabPane("Give", id="give-tab"):
                     yield Label("ITEM SEARCH", classes="section-title")
                     yield Input(
-                        placeholder="Try: netherite sword, deep slate, fireworks…",
+                        placeholder="Try: netherite sword, mending, sharpness V, fireworks…",
                         id="item-search",
                     )
                     yield OptionList(id="matches")
@@ -1873,7 +1873,7 @@ class MinecraftAdminApp(App[None]):
 
     def _select_item(self, item_id: str) -> None:
         self.selected_item = item_id
-        self.query_one("#selected-item", Label).update(f"Selected: {item_id}")
+        self.query_one("#selected-item", Label).update(Text(f"Selected: {item_id}"))
 
     @on(Button.Pressed, "#give-item")
     def give_pressed(self) -> None:
